@@ -1,0 +1,16 @@
+{
+  "name": "image-and-video-frontend",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "lint": "eslint \"frontend/**/*.js\" \"tests/e2e/**/*.js\" --no-error-on-unmatched-pattern",
+    "format": "prettier --write frontend tests/e2e",
+    "format:check": "prettier --check frontend tests/e2e"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.18.0",
+    "eslint": "^9.18.0",
+    "globals": "^15.14.0",
+    "prettier": "^3.4.2"
+  }
+}
