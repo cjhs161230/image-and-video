@@ -51,7 +51,11 @@ def test_settings_store_persists_only_public_settings(tmp_path: Path) -> None:
 def test_secret_status_reports_presence_without_exposing_values() -> None:
     secrets = SecretSettings(
         dashscope_api_key="dash-secret",
+        matsca_app_api_key="",
+        matsca_app_id="",
+        matsca_app_secret="",
         matsca_direct_api_key="direct-secret",
+        matsca_native_api_key="",
         deepseek_api_key="deep-secret",
     )
 
@@ -60,4 +64,3 @@ def test_secret_status_reports_presence_without_exposing_values() -> None:
         "matsca": {"app": False, "direct": True, "native": False},
         "deepseek": True,
     }
-

@@ -91,8 +91,13 @@ class DeepSeekPlanner:
     @staticmethod
     def _system_prompt() -> str:
         return (
-            "你是视频分镜规划器。只输出严格 JSON。必须包含 global_prompt、"
+            "你是视频分镜规划器。只输出严格 JSON object，不要输出 Markdown。"
+            "JSON 必须包含 global_prompt、"
             "character_lock、scene_lock、camera_lock、keyframes 和 segments。"
             "keyframes 包含 frame、description、prompt；segments 包含 "
-            "start_frame、end_frame、motion。"
+            "start_frame、end_frame、motion。示例 JSON："
+            '{"global_prompt":"scene","character_lock":"hero",'
+            '"scene_lock":"room","camera_lock":"wide",'
+            '"keyframes":[{"frame":0,"description":"start","prompt":"start"}],'
+            '"segments":[]}'
         )

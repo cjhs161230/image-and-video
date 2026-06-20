@@ -50,7 +50,7 @@ class SecretSettings(BaseSettings):
     matsca_native_api_key: str = ""
     deepseek_base_url: str = "https://api.deepseek.com"
     deepseek_api_key: str = ""
-    deepseek_model: str = "deepseek-chat"
+    deepseek_model: str = "deepseek-v4-flash"
 
     def status(self) -> dict[str, Any]:
         return {
@@ -85,4 +85,3 @@ class SettingsStore:
             encoding="utf-8",
         )
         temporary.replace(self.path)
-

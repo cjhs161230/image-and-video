@@ -36,7 +36,8 @@ class ImageJobHandler:
         output_root: Path,
         matsca_provider: Callable[[str], MatscaImageProvider],
         dashscope_provider: Callable[[], DashScopeImageProvider] | None = None,
-        downloader: Callable[[str], bytes] = download_image,
+        downloader: Callable[..., bytes] = download_image,
+        native_download_proxy: str = "",
     ):
         self.queue = queue
         self.media = media
@@ -44,6 +45,7 @@ class ImageJobHandler:
         self.matsca_provider = matsca_provider
         self.dashscope_provider = dashscope_provider
         self.downloader = downloader
+        self.native_download_proxy = native_download_proxy
 
     def handle(self, job: Job, *, worker_id: str) -> None:
         payload = cast(dict[str, object], job.payload)
@@ -92,7 +94,12 @@ class ImageJobHandler:
         for index, generated in enumerate(images):
             content = generated.content
             if content is None and generated.url:
-                content = self.downloader(generated.url)
+                if str(payload.get("matsca_mode", "")) == "native":
+                    content = self.downloader(
+                        generated.url, proxy=self.native_download_proxy or None
+                    )
+                else:
+                    content = self.downloader(generated.url)
             if content is None:
                 raise ValueError("图片结果没有可保存内容")
             extension = str(payload["output_format"])

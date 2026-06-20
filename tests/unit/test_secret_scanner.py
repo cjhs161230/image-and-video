@@ -38,6 +38,24 @@ class SecretScannerTests(unittest.TestCase):
 
             self.assertEqual(scan_paths([root]), [])
 
+    def test_scan_paths_skips_local_env_but_scans_example(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            local_secret = "sk-" + "real-local-sensitive-value"
+            template_secret = "sk-" + "real-template-sensitive-value"
+            (root / ".env").write_text(
+                f"API_KEY={local_secret}\n",
+                encoding="utf-8",
+            )
+            (root / ".env.example").write_text(
+                f"API_KEY={template_secret}\n",
+                encoding="utf-8",
+            )
+
+            findings = scan_paths([root])
+
+            self.assertEqual([finding.path.name for finding in findings], [".env.example"])
+
 
 if __name__ == "__main__":
     unittest.main()

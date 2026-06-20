@@ -83,7 +83,7 @@ draft → planning → awaiting_storyboard_approval
 ### 阶段 0：安全阻塞项与计划落盘
 
 - [x] 将本计划写入目标根目录并标记为 `Active`。
-- [ ] 用户轮换旧项目中曾明文保存的 DashScope、Matsca 和 DeepSeek 凭证。
+- [x] 用户轮换旧项目中曾明文保存的 DashScope、Matsca 和 DeepSeek 凭证。
 - [x] 不复制旧 `.env`、`config.json`、虚拟环境或缓存。
 - [x] 检查 uv、Node、npm、Git、GitHub CLI 和 FFmpeg（`gh` 未安装，记录为阶段 13 前置项）。
 - [x] 创建秘密扫描器并以测试驱动验证。
@@ -93,7 +93,7 @@ draft → planning → awaiting_storyboard_approval
 
 - [x] 建立规定目录结构、`pyproject.toml`、uv 锁文件和前端工具配置。
 - [x] 创建完整 `.gitignore`、`.env.example` 和英文 `AGENTS.md`。
-- [ ] 初始化本地 Git；在凭证轮换和扫描通过后创建首个提交。
+- [x] 初始化本地 Git；在凭证轮换和扫描通过后创建首个提交。
 
 ### 阶段 2：配置、日志与基础 API
 
@@ -112,6 +112,7 @@ draft → planning → awaiting_storyboard_approval
 
 - [x] 迁移 DashScope 四模型。
 - [x] 实现 Matsca generations/edits、三种模式、Base64/URL 和原生代理。
+  - 说明：Matsca 接入文档确认 `app`、`direct`、`native` 为 Key 级模式；图片接口为 `/v1/images/generations` 和 `/v1/images/edits`；`native` 同步图片结果可能返回官方图片资源 URL，下载阶段如无法直连需配置 HTTP/SOCKS 代理。
 - [x] 实现 DeepSeek 规划、复审和有限重试。
 - [x] 实现凭证级全局渐进并发、抖动、退避和错误分类。
 
@@ -129,53 +130,56 @@ draft → planning → awaiting_storyboard_approval
 
 ### 阶段 7：关键帧门禁
 
-- [ ] 生成、预览和指定重生成 PNG 关键帧。
-- [ ] 关键帧变更只使相邻片段失效。
-- [ ] 关键帧完成后暂停，等待用户批准。
+- [x] 生成、预览和指定重生成 PNG 关键帧。
+- [x] 关键帧变更只使相邻片段失效。
+- [x] 关键帧完成后暂停，等待用户批准。
 
 ### 阶段 8：连续帧、恢复和合成
 
-- [ ] 片段内顺序、片段间并行生成。
-- [ ] 第一中间帧使用锚点加最多 7 张用户参考图；后续帧使用锚点、上一帧加最多 6 张用户参考图。
-- [ ] 支持缺失/失效帧补生成和超时人工处理。
-- [ ] 无缺帧后自动合成静音 H.264/yuv420p MP4。
-- [ ] 帧编号支持超过 999。
+- [x] 片段内顺序、片段间并行生成。
+- [x] 第一中间帧使用锚点加最多 7 张用户参考图；后续帧使用锚点、上一帧加最多 6 张用户参考图。
+- [x] 支持缺失/失效帧补生成和超时人工处理。
+- [x] 无缺帧后自动合成静音 H.264/yuv420p MP4。
+- [x] 帧编号支持超过 999。
 
 ### 阶段 9：统一历史与媒体安全
 
-- [ ] 实现图片/视频统一历史、筛选、缩略图、封面和日志摘要。
-- [ ] 媒体访问仅允许数据库登记且位于 `data/` 内的文件。
-- [ ] 二次确认后删除记录和文件；部分失败必须可恢复。
+- [x] 实现图片/视频统一历史、筛选、缩略图、封面和日志摘要。
+- [x] 媒体访问仅允许数据库登记且位于 `data/` 内的文件。
+- [x] 二次确认后删除记录和文件；部分失败必须可恢复。
 
 ### 阶段 10：前端
 
-- [ ] 建立图片工作台、视频项目、历史、设置四个中文页面。
-- [ ] 展示阶段和帧级统计，支持任务控制和两次人工门禁。
-- [ ] 实现积分/磁盘估算和分级确认。
-- [ ] 设置页只显示凭证配置状态。
+- [x] 建立图片工作台、视频项目、历史、设置四个中文页面。
+- [x] 展示阶段和帧级统计，支持任务控制和两次人工门禁。
+- [x] 实现积分/磁盘估算和分级确认。
+- [x] 设置页只显示凭证配置状态。
 
 ### 阶段 11：旧数据迁移
 
-- [ ] 使用 SQLite backup API 创建只读快照，不修改旧库。
-- [ ] 根据每条记录的 `save_path` 和 `url_path` 定位真实媒体。
-- [ ] 复制媒体并计算大小和 SHA-256；缺失媒体标记 `missing`。
-- [ ] 归档旧日志但不导入旧密钥配置。
-- [ ] 生成可审计、可重复运行的迁移报告。
+- [x] 使用 SQLite backup API 创建只读快照，不修改旧库。
+- [x] 根据每条记录的 `save_path` 和 `url_path` 定位真实媒体。
+- [x] 复制媒体并计算大小和 SHA-256；缺失媒体标记 `missing`。
+- [x] 归档旧日志但不导入旧密钥配置。
+- [x] 生成可审计、可重复运行的迁移报告。
 
 ### 阶段 12：启动、停止与文档
 
-- [ ] `start.bat` 检查依赖、migration、FFmpeg，启动 Web/Worker并打开浏览器。
-- [ ] `stop.bat` 只停止 PID 文件记录的本项目进程。
-- [ ] 完成中文 README、需求、架构、开发、API 和迁移文档。
+- [x] `start.bat` 检查依赖、migration、FFmpeg，启动 Web/Worker并打开浏览器。
+  - 说明：启动脚本已改为读取 `IMAGE_VIDEO_HOST` / `IMAGE_VIDEO_PORT`，默认绑定 `127.0.0.1:17860`，并在启动前检查端口占用，避免固定使用 `8000` 及附近端口。
+- [x] `stop.bat` 只停止 PID 文件记录的本项目进程。
+- [x] 完成中文 README、需求、架构、开发、API 和迁移文档。
 
 ### 阶段 13：验证、GitHub 私有仓库和旧项目归档
 
-- [ ] 通过 Ruff、Pyright、pytest、ESLint、Prettier 和 Chrome/Edge 小样 E2E。
+- [x] 通过 Ruff、Pyright、pytest、ESLint、Prettier 和 Chrome/Edge 小样 E2E。
 - [ ] 显式运行低成本 DeepSeek/Matsca/FFmpeg smoke test。
-- [ ] 再次秘密扫描并检查 Git 暂存内容。
-- [ ] 创建并推送 GitHub 私有仓库 `image-and-video`。
+  - 说明：DeepSeek 与 FFmpeg smoke 已通过；Matsca direct 曾返回 502；Matsca native 能返回图片 URL，但结果图下载阶段遇到 403，结合接入文档判断可能需要为官方图片资源下载配置 HTTP/SOCKS 代理。因此本项暂不勾选。
+- [x] 再次秘密扫描并检查 Git 暂存内容。
+- [x] 创建并推送 GitHub 私有仓库 `image-and-video`。
 - [ ] 最终启动验收后把计划标记 `Completed`。
-- [ ] 验证绝对路径后将旧项目移动到统一归档目录，不删除。
+  - 说明：默认端口改为 `17860` 后，`start.bat` 启动验收与 `/api/v1/health` 检查已通过；但因 Matsca smoke test 未完整通过，计划仍保持 `Active`，本项暂不勾选。
+- [x] 验证绝对路径后将旧项目移动到统一归档目录，不删除。
 
 ## 必测场景
 

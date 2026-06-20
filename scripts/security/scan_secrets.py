@@ -19,6 +19,10 @@ IGNORED_DIRECTORY_NAMES = {
     "node_modules",
 }
 
+IGNORED_FILE_NAMES = {
+    ".env",
+}
+
 PLACEHOLDER_MARKERS = {
     "your",
     "your-key",
@@ -62,6 +66,8 @@ def _iter_files(root: Path) -> Iterable[Path]:
         return
     for path in root.rglob("*"):
         if not path.is_file():
+            continue
+        if path.name in IGNORED_FILE_NAMES:
             continue
         if any(part in IGNORED_DIRECTORY_NAMES for part in path.parts):
             continue

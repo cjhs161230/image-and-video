@@ -19,4 +19,6 @@ def test_alembic_upgrade_creates_queue_tables(tmp_path: Path) -> None:
         "video_projects",
         "video_reference_images",
         "video_storyboard_versions",
+        "video_keyframes",
+        "video_frames",
     }.issubset(tables)

@@ -142,3 +142,46 @@ class VideoStoryboardVersion(Base):
     plan: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
     suggestion: Mapped[str] = mapped_column(Text, nullable=False, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class VideoKeyframe(Base):
+    __tablename__ = "video_keyframes"
+    __table_args__ = (
+        Index("ix_video_keyframes_project_frame", "project_id", "frame", unique=True),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    project_id: Mapped[str] = mapped_column(
+        ForeignKey("video_projects.id", ondelete="CASCADE"), nullable=False
+    )
+    storyboard_version_id: Mapped[str] = mapped_column(
+        ForeignKey("video_storyboard_versions.id", ondelete="CASCADE"), nullable=False
+    )
+    frame: Mapped[int] = mapped_column(Integer, nullable=False)
+    prompt: Mapped[str] = mapped_column(Text, nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    path: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String(50), nullable=False, default="completed")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class VideoFrame(Base):
+    __tablename__ = "video_frames"
+    __table_args__ = (
+        Index("ix_video_frames_project_frame", "project_id", "frame", unique=True),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    project_id: Mapped[str] = mapped_column(
+        ForeignKey("video_projects.id", ondelete="CASCADE"), nullable=False
+    )
+    frame: Mapped[int] = mapped_column(Integer, nullable=False)
+    segment_start_frame: Mapped[int] = mapped_column(Integer, nullable=False)
+    segment_end_frame: Mapped[int] = mapped_column(Integer, nullable=False)
+    prompt: Mapped[str] = mapped_column(Text, nullable=False)
+    path: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String(50), nullable=False, default="completed")
+    error_message: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

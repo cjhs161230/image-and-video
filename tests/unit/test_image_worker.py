@@ -43,6 +43,17 @@ class FakeDashScopeProvider:
             raw={},
         )
 
+
+class FakeNativeMatscaProvider:
+    def generate(self, **kwargs: object) -> list[GeneratedImage]:
+        del kwargs
+        return [GeneratedImage(url="https://official.example/image.png")]
+
+    def edit(self, **kwargs: object) -> list[GeneratedImage]:
+        del kwargs
+        return [GeneratedImage(url="https://official.example/image.png")]
+
+
 def test_image_handler_saves_media_thumbnail_and_completes_job(tmp_path: Path) -> None:
     engine = create_database_engine(tmp_path / "workbench.db")
     initialize_database(engine)
@@ -69,6 +80,46 @@ def test_image_handler_saves_media_thumbnail_and_completes_job(tmp_path: Path) -
     assert Path(assets[0].thumbnail_path).is_file()
     assert assets[0].width == 64
     assert assets[0].height == 32
+
+
+def test_image_handler_uses_native_download_proxy_for_native_url_result(
+    tmp_path: Path,
+) -> None:
+    engine = create_database_engine(tmp_path / "workbench.db")
+    initialize_database(engine)
+    queue = JobQueue(engine)
+    service = ImageJobService(queue)
+    job_id = service.submit(
+        ImageJobRequest(
+            model="gpt-image-2",
+            prompt="cat",
+            matsca_mode="native",
+            output_format="png",
+        )
+    )
+    claimed = queue.claim_next("worker-a")
+    assert claimed is not None
+    calls: list[tuple[str, str | None]] = []
+
+    def downloader(url: str, *, proxy: str | None = None) -> bytes:
+        calls.append((url, proxy))
+        return png_bytes()
+
+    handler = ImageJobHandler(
+        queue=queue,
+        media=MediaRepository(engine),
+        output_root=tmp_path / "outputs",
+        matsca_provider=lambda mode: FakeNativeMatscaProvider(),
+        downloader=downloader,
+        native_download_proxy="http://127.0.0.1:7890",
+    )
+
+    handler.handle(claimed, worker_id="worker-a")
+
+    assert calls == [
+        ("https://official.example/image.png", "http://127.0.0.1:7890")
+    ]
+    assert queue.get(job_id).status == JobStatus.COMPLETED
 
 
 def test_image_handler_uses_reference_media_for_gpt_edit(tmp_path: Path) -> None:
