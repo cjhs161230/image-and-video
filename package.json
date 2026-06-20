@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test:e2e": "node tests/e2e/frontend-static.test.js && node tests/e2e/windows-scripts.test.js",
+    "test:e2e": "node tests/e2e/frontend-static.test.js && node tests/e2e/frontend-client.test.js && node tests/e2e/windows-scripts.test.js",
     "lint": "eslint \"frontend/**/*.js\" \"tests/e2e/**/*.js\" --no-error-on-unmatched-pattern",
     "format": "prettier --write frontend tests/e2e",
     "format:check": "prettier --check frontend tests/e2e"

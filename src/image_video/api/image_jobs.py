@@ -17,6 +17,7 @@ def _queue(request: Request) -> JobQueue:
 
 def _job_data(request: Request, job_id: str) -> dict[str, Any]:
     job = _queue(request).get(job_id)
+    media = request.app.state.media_repository.for_job(job_id)
     return {
         "id": job.id,
         "kind": job.kind,
@@ -24,6 +25,10 @@ def _job_data(request: Request, job_id: str) -> dict[str, Any]:
         "attempt_count": job.attempt_count,
         "error_code": job.error_code,
         "error_message": job.error_message,
+        "media": [
+            {"id": asset.id, "url": f"/api/v1/media/{asset.id}"}
+            for asset in media
+        ],
     }
 
 
@@ -54,4 +59,3 @@ def resume_image_job(request: Request, job_id: str) -> dict[str, Any]:
 def cancel_image_job(request: Request, job_id: str) -> dict[str, Any]:
     _queue(request).cancel(job_id)
     return envelope(_job_data(request, job_id))
-

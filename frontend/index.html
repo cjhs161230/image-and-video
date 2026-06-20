@@ -4,10 +4,16 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>图像与视频工作台</title>
+    <link rel="stylesheet" href="/assets/styles.css" />
   </head>
   <body>
     <main id="app">
-      <h1>图像与视频工作台</h1>
+      <header>
+        <p class="eyebrow">Windows 本地图像工具</p>
+        <h1>图像与视频工作台</h1>
+        <p>当前基础闭环支持普通图片任务；视频工作流正在重新验收。</p>
+      </header>
+
       <nav aria-label="主导航">
         <a href="#image-workbench">图片工作台</a>
         <a href="#video-projects">视频项目</a>
@@ -17,61 +23,75 @@
 
       <section id="image-workbench" data-page="图片工作台">
         <h2>图片工作台</h2>
-        <form>
+        <form id="image-job-form">
           <label>
             提示词
-            <textarea name="prompt" placeholder="输入图片提示词"></textarea>
+            <textarea name="prompt" required placeholder="输入图片提示词"></textarea>
           </label>
-          <label>
-            模型
-            <select name="model">
-              <option>gpt-image-2</option>
-              <option>wan2.7-image</option>
-              <option>wan2.7-image-pro</option>
-              <option>qwen-image-2.0</option>
-              <option>qwen-image-2.0-pro</option>
-            </select>
-          </label>
-          <p>积分估算：提交前根据模型、张数和尺寸估算。</p>
-          <p>磁盘估算：提交前根据输出数量估算本地占用。</p>
-          <button type="button">生成图片</button>
+          <div class="form-grid">
+            <label>
+              模型
+              <select name="model">
+                <option>gpt-image-2</option>
+                <option>wan2.7-image</option>
+                <option>wan2.7-image-pro</option>
+                <option>qwen-image-2.0</option>
+                <option>qwen-image-2.0-pro</option>
+              </select>
+            </label>
+            <label>
+              输出数量
+              <input name="n" type="number" value="1" min="1" max="4" />
+            </label>
+            <label>
+              输出格式
+              <select name="output_format">
+                <option value="png">PNG</option>
+                <option value="jpeg">JPEG</option>
+                <option value="webp">WebP</option>
+              </select>
+            </label>
+            <label>
+              Matsca 模式
+              <select name="matsca_mode">
+                <option value="direct">直连</option>
+                <option value="app">应用</option>
+                <option value="native">原生</option>
+              </select>
+            </label>
+          </div>
+          <p>积分估算与磁盘估算将在视频阶段重新闭合。</p>
+          <button type="submit">生成图片</button>
         </form>
+
+        <div id="job-panel" class="job-panel" hidden>
+          <div><strong>任务状态：</strong><span id="job-status">queued</span></div>
+          <div class="controls" aria-label="任务控制">
+            <button type="button" data-action="pause">暂停</button>
+            <button type="button" data-action="resume">继续</button>
+            <button type="button" data-action="cancel">取消</button>
+          </div>
+          <p id="job-error" role="alert"></p>
+          <div id="job-results" class="results"></div>
+        </div>
       </section>
 
       <section id="video-projects" data-page="视频项目">
         <h2>视频项目</h2>
-        <p>阶段统计：草稿、分镜、关键帧、连续帧、合成。</p>
-        <p>帧级统计：已完成、缺失、需人工处理。</p>
-        <div aria-label="任务控制">
-          <button type="button">暂停</button>
-          <button type="button">继续</button>
-          <button type="button">取消</button>
-        </div>
-        <div aria-label="人工门禁">
-          <button type="button">分镜确认</button>
-          <button type="button">关键帧确认</button>
-        </div>
+        <p>视频队列、连续帧和两次人工门禁正在重新验收，本阶段暂不开放操作。</p>
       </section>
 
       <section id="history" data-page="历史">
         <h2>历史</h2>
-        <label>
-          筛选
-          <select name="history-kind">
-            <option>全部</option>
-            <option>图片</option>
-            <option>视频</option>
-          </select>
-        </label>
-        <p>显示缩略图、封面、状态摘要和删除入口。</p>
+        <p>普通图片完成后会在上方显示受控媒体结果。统一历史页面将在后续阶段闭合。</p>
       </section>
 
       <section id="settings" data-page="设置">
         <h2>设置</h2>
-        <p>凭证配置状态：只显示是否已配置，不显示密钥内容。</p>
-        <p>FFmpeg 路径、代理、并发和费率可在本地普通设置中维护。</p>
+        <button id="load-config-status" type="button">检查凭证配置状态</button>
+        <pre id="config-status">尚未检查</pre>
       </section>
     </main>
-    <script type="module" src="./js/app.js"></script>
+    <script type="module" src="/assets/js/app.js"></script>
   </body>
 </html>

@@ -73,8 +73,12 @@ def test_history_lists_images_and_completed_videos_with_filters(tmp_path: Path) 
     videos = service.list_history(kind="video")
 
     assert [item["kind"] for item in all_items] == ["image", "video"]
-    assert all_items[0]["thumbnail_path"] == thumb_path.as_posix()
-    assert all_items[1]["cover_path"] == video_path.as_posix()
+    assert "path" not in all_items[0]
+    assert all_items[0]["media_url"] == "/api/v1/media/media-1"
+    assert all_items[0]["thumbnail_url"] == "/api/v1/media/media-1"
+    assert "path" not in all_items[1]
+    assert all_items[1]["media_url"] == ""
+    assert all_items[1]["cover_url"] == ""
     assert all_items[1]["log_summary"] == "状态：completed"
     assert [item["id"] for item in videos] == ["project-1"]
 
@@ -182,3 +186,47 @@ def test_delete_media_requires_confirmation_and_keeps_record_on_file_failure(
     assert deleted["status"] == "deleted"
     assert not media_path.exists()
     assert service.resolve_media_path("delete-media") is None
+
+
+def test_delete_media_rejects_thumbnail_outside_data_root(tmp_path: Path) -> None:
+    service = make_history(tmp_path)
+    now = datetime.now(UTC)
+    media_path = tmp_path / "data" / "safe.png"
+    outside_thumbnail = tmp_path / "outside-thumbnail.jpg"
+    media_path.parent.mkdir(parents=True, exist_ok=True)
+    media_path.write_bytes(b"safe")
+    outside_thumbnail.write_bytes(b"outside")
+    with Session(service.engine) as session:
+        session.add(
+            Job(
+                id="job-outside-thumbnail",
+                kind="image.generate",
+                payload={},
+                status=JobStatus.COMPLETED,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        session.add(
+            MediaAsset(
+                id="outside-thumbnail",
+                job_id="job-outside-thumbnail",
+                media_type="image",
+                path=media_path.as_posix(),
+                thumbnail_path=outside_thumbnail.as_posix(),
+                width=1,
+                height=1,
+                file_size_bytes=4,
+                sha256="3" * 64,
+                created_at=now,
+            )
+        )
+        session.commit()
+
+    result = service.delete_media("outside-thumbnail", confirm=True)
+
+    assert result["status"] == "partial_failed"
+    assert media_path.exists()
+    assert outside_thumbnail.exists()
+    with Session(service.engine) as session:
+        assert session.get(MediaAsset, "outside-thumbnail") is not None

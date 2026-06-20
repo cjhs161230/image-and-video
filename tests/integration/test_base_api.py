@@ -1,14 +1,21 @@
 from collections.abc import Mapping
 from datetime import UTC, datetime
+from io import BytesIO
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
+from PIL import Image
 from sqlalchemy.orm import Session
 
 from image_video.domain.jobs import JobStatus
+from image_video.infrastructure.database.media import MediaRepository
 from image_video.infrastructure.database.models import Job, MediaAsset
 from image_video.infrastructure.providers.deepseek import StoryboardPlan
+from image_video.infrastructure.providers.matsca import GeneratedImage
 from image_video.main import create_app
+from image_video.worker.image_handler import ImageJobHandler
+from image_video.worker.runner import WorkerRunner
 
 
 class FakeStoryboardPlanner:
@@ -26,6 +33,50 @@ class FakeStoryboardPlanner:
                 {"start_frame": 0, "end_frame": 12, "motion": "turn head"},
             ],
         )
+
+
+def test_image_job_runs_from_api_through_worker_to_controlled_media(
+    tmp_path: Path,
+) -> None:
+    app = create_app(data_root=tmp_path)
+    output = BytesIO()
+    Image.new("RGB", (8, 8), "blue").save(output, format="PNG")
+
+    class FakeProvider:
+        def generate(self, **kwargs: object) -> list[GeneratedImage]:
+            del kwargs
+            return [GeneratedImage(content=output.getvalue())]
+
+        def edit(self, **kwargs: object) -> list[GeneratedImage]:
+            del kwargs
+            return [GeneratedImage(content=output.getvalue())]
+
+    handler = ImageJobHandler(
+        queue=app.state.job_queue,
+        media=MediaRepository(app.state.job_queue.engine),
+        output_root=tmp_path / "media",
+        matsca_provider=lambda mode: FakeProvider(),
+    )
+    runner = WorkerRunner(
+        queue=app.state.job_queue,
+        handlers={"image.generate": handler},
+        worker_id="integration-worker",
+    )
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/v1/image-jobs",
+            json={"model": "gpt-image-2", "prompt": "blue square"},
+        )
+        job_id = created.json()["data"]["job_id"]
+        assert runner.run_once()
+        status = client.get(f"/api/v1/image-jobs/{job_id}")
+        media_url = status.json()["data"]["media"][0]["url"]
+        media = client.get(media_url)
+
+    assert status.json()["data"]["status"] == "completed"
+    assert media.status_code == 200
+    assert media.content == output.getvalue()
 
 
 def test_health_models_and_config_status_are_available_under_v1() -> None:
@@ -46,6 +97,29 @@ def test_health_models_and_config_status_are_available_under_v1() -> None:
     }
     assert status.status_code == 200
     assert "request_id" in status.json()
+
+
+def test_root_serves_the_local_frontend(tmp_path: Path) -> None:
+    with TestClient(create_app(data_root=tmp_path)) as client:
+        response = client.get("/")
+        script = client.get("/assets/js/app.js")
+
+    assert response.status_code == 200
+    assert "图像与视频工作台" in response.text
+    assert script.status_code == 200
+    assert "/api/v1/image-jobs" in script.text
+
+
+def test_app_starts_without_provider_credentials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    app = create_app(data_root=tmp_path / "data")
+
+    with TestClient(app) as client:
+        response = client.get("/api/v1/health")
+    assert response.status_code == 200
 
 
 def test_settings_endpoint_rejects_secret_fields() -> None:
@@ -86,6 +160,75 @@ def test_image_job_api_creates_and_controls_persistent_job(tmp_path: Path) -> No
 
         cancelled = client.post(f"/api/v1/image-jobs/{job_id}/cancel")
         assert cancelled.json()["data"]["status"] == "cancelled"
+
+
+def test_completed_image_job_status_returns_controlled_media_urls(
+    tmp_path: Path,
+) -> None:
+    app = create_app(data_root=tmp_path)
+    now = datetime.now(UTC)
+    media_path = tmp_path / "image.png"
+    media_path.write_bytes(b"image")
+    with Session(app.state.job_queue.engine) as session:
+        session.add(
+            Job(
+                id="completed-image",
+                kind="image.generate",
+                payload={"prompt": "cat"},
+                status=JobStatus.COMPLETED,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        session.add(
+            MediaAsset(
+                id="media-result",
+                job_id="completed-image",
+                media_type="image",
+                path=media_path.as_posix(),
+                thumbnail_path=media_path.as_posix(),
+                width=1,
+                height=1,
+                file_size_bytes=5,
+                sha256="0" * 64,
+                created_at=now,
+            )
+        )
+        session.commit()
+
+    with TestClient(app) as client:
+        response = client.get("/api/v1/image-jobs/completed-image")
+
+    assert response.status_code == 200
+    assert response.json()["data"]["media"] == [
+        {"id": "media-result", "url": "/api/v1/media/media-result"}
+    ]
+
+
+def test_api_maps_missing_invalid_and_conflicting_business_errors(
+    tmp_path: Path,
+) -> None:
+    with TestClient(create_app(data_root=tmp_path), raise_server_exceptions=False) as client:
+        missing = client.get("/api/v1/image-jobs/not-found")
+        invalid = client.post(
+            "/api/v1/image-jobs",
+            json={"model": "unknown", "prompt": "cat"},
+        )
+        created = client.post(
+            "/api/v1/video-projects",
+            json={"title": "demo", "description": "walk"},
+        )
+        project_id = created.json()["data"]["project_id"]
+        conflict = client.post(
+            f"/api/v1/video-projects/{project_id}/keyframes/confirm"
+        )
+
+    assert missing.status_code == 404
+    assert missing.json()["error"]["code"] == "NOT_FOUND"
+    assert invalid.status_code == 422
+    assert invalid.json()["error"]["code"] == "BUSINESS_VALIDATION_ERROR"
+    assert conflict.status_code == 409
+    assert conflict.json()["error"]["code"] == "STATE_CONFLICT"
 
 
 def test_video_project_api_saves_draft_and_limits_references(tmp_path: Path) -> None:
@@ -297,7 +440,9 @@ def test_history_api_lists_unified_history(tmp_path: Path) -> None:
 
     assert history.status_code == 200
     assert history.json()["data"][0]["kind"] == "video"
-    assert history.json()["data"][0]["cover_path"].endswith(".mp4")
+    assert "path" not in history.json()["data"][0]
+    assert history.json()["data"][0]["media_url"] == ""
+    assert history.json()["data"][0]["cover_url"] == ""
 
 
 def test_media_api_serves_only_registered_data_paths(tmp_path: Path) -> None:

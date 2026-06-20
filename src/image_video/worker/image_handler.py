@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Callable
 from pathlib import Path
-from typing import Protocol, cast
+from typing import Any, Protocol, cast
 
 from PIL import Image
 
@@ -18,13 +18,37 @@ from image_video.infrastructure.providers.matsca import GeneratedImage
 
 
 class MatscaImageProvider(Protocol):
-    def generate(self, **kwargs: object) -> list[GeneratedImage]: ...
+    def generate(
+        self,
+        *,
+        prompt: str,
+        size: str,
+        quality: str,
+        style: str,
+        n: int,
+        background: str = "auto",
+        output_format: str = "png",
+    ) -> list[GeneratedImage]: ...
 
-    def edit(self, **kwargs: object) -> list[GeneratedImage]: ...
+    def edit(
+        self,
+        *,
+        prompt: str,
+        images: list[bytes],
+        size: str,
+        quality: str,
+        output_format: str = "png",
+    ) -> list[GeneratedImage]: ...
 
 
 class DashScopeImageProvider(Protocol):
-    def generate(self, **kwargs: object) -> DashScopeResult: ...
+    def generate(
+        self,
+        *,
+        model: str,
+        params: dict[str, Any],
+        input_images: list[bytes] | None = None,
+    ) -> DashScopeResult: ...
 
 
 class ImageJobHandler:
@@ -89,6 +113,8 @@ class ImageJobHandler:
                 input_images=reference_images,
             )
             images = [GeneratedImage(url=url) for url in result.image_urls]
+        if not self.queue.is_running_by(job.id, worker_id):
+            return
         directory = self.output_root / "images" / job.id
         directory.mkdir(parents=True, exist_ok=True)
         for index, generated in enumerate(images):

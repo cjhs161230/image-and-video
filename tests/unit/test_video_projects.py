@@ -8,6 +8,7 @@ import pytest
 from sqlalchemy.orm import Session
 
 from image_video.application.video_projects import (
+    MatscaFrameGenerator,
     MatscaKeyframeGenerator,
     VideoProjectDraftRequest,
     VideoProjectService,
@@ -46,6 +47,15 @@ class FakeMatscaUrlProvider:
         return [GeneratedImage(url="https://cdn.test/keyframe.png")]
 
 
+class RecordingMatscaEditProvider:
+    def __init__(self):
+        self.calls: list[dict[str, object]] = []
+
+    def edit(self, **kwargs: object) -> list[GeneratedImage]:
+        self.calls.append(dict(kwargs))
+        return [GeneratedImage(content=b"generated-frame")]
+
+
 class RecordingFrameGenerator:
     def __init__(self):
         self.calls: list[dict[str, object]] = []
@@ -82,7 +92,115 @@ class RecordingFfmpegRunner:
 def make_service(tmp_path: Path) -> VideoProjectService:
     engine = create_database_engine(tmp_path / "video.db")
     initialize_database(engine)
-    return VideoProjectService(engine)
+    return VideoProjectService(engine, data_root=tmp_path / "data")
+
+
+def test_video_outputs_are_written_under_configured_data_root(
+    tmp_path: Path,
+) -> None:
+    service = make_service(tmp_path)
+    project_id = service.create_draft(
+        VideoProjectDraftRequest(title="demo", description="walk", reference_images=[])
+    )
+    version_id = service.save_storyboard_version(
+        project_id,
+        source="user",
+        plan=StoryboardPlan(
+            global_prompt="scene",
+            character_lock="hero",
+            scene_lock="street",
+            camera_lock="wide",
+            keyframes=[
+                {"frame": 0, "description": "start", "prompt": "start"},
+                {"frame": 2, "description": "end", "prompt": "end"},
+            ],
+            segments=[{"start_frame": 0, "end_frame": 2, "motion": "walk"}],
+        ),
+    )
+    service.confirm_storyboard(project_id, version_id)
+
+    keyframes = service.generate_keyframes(project_id, generator=lambda prompt: b"png")
+
+    expected_root = (tmp_path / "data").resolve()
+    assert all(
+        Path(str(item["path"])).resolve().is_relative_to(expected_root)
+        for item in keyframes
+    )
+
+
+def test_matsca_frame_generator_uses_continuity_references_within_limit(
+    tmp_path: Path,
+) -> None:
+    start = tmp_path / "start.png"
+    end = tmp_path / "end.png"
+    previous = tmp_path / "previous.png"
+    start.write_bytes(b"start")
+    end.write_bytes(b"end")
+    previous.write_bytes(b"previous")
+    provider = RecordingMatscaEditProvider()
+    reference_bytes = {f"ref-{index}": f"ref-{index}".encode() for index in range(8)}
+    generator = MatscaFrameGenerator(
+        provider,
+        reference_loader=lambda ids: [reference_bytes[item] for item in ids],
+    )
+
+    first = generator(
+        frame=1,
+        prompt="walk",
+        references=[f"ref-{index}" for index in range(7)],
+        previous_frame_path=start.as_posix(),
+        anchor_frame_paths=[start.as_posix(), end.as_posix()],
+    )
+    later = generator(
+        frame=2,
+        prompt="walk",
+        references=[f"ref-{index}" for index in range(6)],
+        previous_frame_path=previous.as_posix(),
+        anchor_frame_paths=[start.as_posix(), end.as_posix()],
+    )
+
+    assert first == b"generated-frame"
+    assert later == b"generated-frame"
+    assert provider.calls[0]["images"] == [
+        b"start",
+        *[reference_bytes[f"ref-{index}"] for index in range(7)],
+    ]
+    assert provider.calls[1]["images"] == [
+        b"end",
+        b"previous",
+        *[reference_bytes[f"ref-{index}"] for index in range(6)],
+    ]
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_status"),
+    [
+        (RuntimeError("provider failed"), "failed"),
+        (TimeoutError("result uncertain"), "needs_attention"),
+    ],
+)
+def test_storyboard_failure_leaves_recoverable_project_status(
+    tmp_path: Path,
+    failure: Exception,
+    expected_status: str,
+) -> None:
+    service = make_service(tmp_path)
+    project_id = service.create_draft(
+        VideoProjectDraftRequest(title="demo", description="walk", reference_images=[])
+    )
+
+    class FailingPlanner:
+        def create_storyboard(self, request: Mapping[str, object]) -> StoryboardPlan:
+            del request
+            raise failure
+
+    with pytest.raises(type(failure)):
+        service.generate_storyboard(project_id, FailingPlanner())
+
+    with Session(service.engine) as session:
+        project = session.get(VideoProject, project_id)
+        assert project is not None
+        assert project.status == expected_status
 
 
 def service_now() -> datetime:
@@ -266,6 +384,88 @@ def test_generate_intermediate_frames_runs_each_segment_in_frame_order(
         assert [frame.frame for frame in persisted] == [1, 2, 4, 5]
 
 
+def test_generate_intermediate_frames_skips_existing_completed_frames(
+    tmp_path: Path,
+) -> None:
+    service = make_service(tmp_path)
+    project_id = service.create_draft(
+        VideoProjectDraftRequest(title="demo", description="walk", reference_images=[])
+    )
+    version_id = service.save_storyboard_version(
+        project_id,
+        source="user",
+        plan=StoryboardPlan(
+            global_prompt="scene",
+            character_lock="hero",
+            scene_lock="street",
+            camera_lock="wide",
+            keyframes=[
+                {"frame": 0, "description": "start", "prompt": "start"},
+                {"frame": 3, "description": "end", "prompt": "end"},
+            ],
+            segments=[{"start_frame": 0, "end_frame": 3, "motion": "walk"}],
+        ),
+    )
+    service.confirm_storyboard(project_id, version_id)
+    service.generate_keyframes(project_id, generator=lambda prompt: prompt.encode())
+    service.confirm_keyframes(project_id)
+    first_generator = RecordingFrameGenerator()
+    service.generate_intermediate_frames(project_id, generator=first_generator)
+    second_generator = RecordingFrameGenerator()
+
+    generated = service.generate_intermediate_frames(
+        project_id, generator=second_generator
+    )
+
+    assert generated == []
+    assert second_generator.calls == []
+    with Session(service.engine) as session:
+        assert session.query(VideoFrame).count() == 2
+
+
+def test_generate_intermediate_frame_timeout_marks_needs_attention(
+    tmp_path: Path,
+) -> None:
+    service = make_service(tmp_path)
+    project_id = service.create_draft(
+        VideoProjectDraftRequest(title="demo", description="walk", reference_images=[])
+    )
+    version_id = service.save_storyboard_version(
+        project_id,
+        source="user",
+        plan=StoryboardPlan(
+            global_prompt="scene",
+            character_lock="hero",
+            scene_lock="street",
+            camera_lock="wide",
+            keyframes=[
+                {"frame": 0, "description": "start", "prompt": "start"},
+                {"frame": 2, "description": "end", "prompt": "end"},
+            ],
+            segments=[{"start_frame": 0, "end_frame": 2, "motion": "walk"}],
+        ),
+    )
+    service.confirm_storyboard(project_id, version_id)
+    service.generate_keyframes(project_id, generator=lambda prompt: prompt.encode())
+    service.confirm_keyframes(project_id)
+
+    with pytest.raises(TimeoutError):
+        service.generate_intermediate_frames(
+            project_id,
+            generator=lambda **kwargs: (_ for _ in ()).throw(
+                TimeoutError("uncertain")
+            ),
+        )
+
+    with Session(service.engine) as session:
+        project = session.get(VideoProject, project_id)
+        frame = session.query(VideoFrame).filter_by(frame=1).one()
+        assert project is not None
+        assert project.status == "needs_attention"
+        assert frame.status == "needs_attention"
+        assert frame.error_message == "上游请求超时，结果状态不确定"
+
+
 def test_generate_intermediate_frames_interleaves_segments_by_offset(
     tmp_path: Path,
 ) -> None:
@@ -340,9 +540,9 @@ def test_intermediate_frame_reference_selection_limits_user_references(
     assert generator.calls[0]["references"] == [f"ref-{index}" for index in range(7)]
     assert generator.calls[0]["previous_frame_path"] is not None
     assert generator.calls[1]["references"] == [f"ref-{index}" for index in range(6)]
-    assert generator.calls[1]["previous_frame_path"] == "data/video_projects/" + (
-        f"{project_id}/frames/frame_000001.png"
-    )
+    assert generator.calls[1]["previous_frame_path"] == (
+        service.data_root / "video_projects" / project_id / "frames" / "frame_000001.png"
+    ).as_posix()
 
 
 def test_regenerate_missing_or_invalid_frame_and_timeout_needs_attention(
@@ -454,6 +654,56 @@ def test_stitch_video_requires_no_missing_frames_and_outputs_silent_h264_mp4(
         assert project is not None
         assert project.status == "completed"
         assert str(project.settings["output_video_path"]).endswith(".mp4")
+
+
+@pytest.mark.parametrize("missing_kind", ["record", "file"])
+def test_stitch_video_rejects_incomplete_frame_sequence(
+    tmp_path: Path,
+    missing_kind: str,
+) -> None:
+    service = make_service(tmp_path)
+    project_id = service.create_draft(
+        VideoProjectDraftRequest(title="demo", description="walk", reference_images=[])
+    )
+    version_id = service.save_storyboard_version(
+        project_id,
+        source="user",
+        plan=StoryboardPlan(
+            global_prompt="scene",
+            character_lock="hero",
+            scene_lock="street",
+            camera_lock="wide",
+            keyframes=[
+                {"frame": 0, "description": "start", "prompt": "start"},
+                {"frame": 3, "description": "end", "prompt": "end"},
+            ],
+            segments=[{"start_frame": 0, "end_frame": 3, "motion": "walk"}],
+        ),
+    )
+    service.confirm_storyboard(project_id, version_id)
+    service.generate_keyframes(project_id, generator=lambda prompt: prompt.encode())
+    service.confirm_keyframes(project_id)
+    if missing_kind == "file":
+        service.generate_intermediate_frames(
+            project_id, generator=lambda **kwargs: f"frame-{kwargs['frame']}".encode()
+        )
+        with Session(service.engine) as session:
+            frame = session.query(VideoFrame).filter_by(frame=1).one()
+            Path(frame.path).unlink()
+
+    runner = RecordingFfmpegRunner()
+    with pytest.raises(ValueError, match="缺失"):
+        service.stitch_video(
+            project_id,
+            ffmpeg_path="ffmpeg.exe",
+            runner=runner,
+        )
+
+    assert runner.commands == []
+    with Session(service.engine) as session:
+        project = session.get(VideoProject, project_id)
+        assert project is not None
+        assert project.status != "completed"
 
 
 def test_frame_numbering_supports_more_than_999(tmp_path: Path) -> None:

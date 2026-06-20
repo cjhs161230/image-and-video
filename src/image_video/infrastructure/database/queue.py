@@ -103,6 +103,15 @@ class JobQueue:
             job.updated_at = utcnow()
             session.commit()
 
+    def is_running_by(self, job_id: str, worker_id: str) -> bool:
+        with Session(self.engine) as session:
+            job = session.get(Job, job_id)
+            return bool(
+                job is not None
+                and job.status == JobStatus.RUNNING
+                and job.locked_by == worker_id
+            )
+
     def complete(self, job_id: str, worker_id: str) -> None:
         self._finish(job_id, worker_id, JobStatus.COMPLETED)
 
@@ -113,6 +122,17 @@ class JobQueue:
             job_id,
             worker_id,
             JobStatus.FAILED,
+            error_code=error_code,
+            error_message=error_message,
+        )
+
+    def needs_attention(
+        self, job_id: str, worker_id: str, *, error_code: str, error_message: str
+    ) -> None:
+        self._finish(
+            job_id,
+            worker_id,
+            JobStatus.NEEDS_ATTENTION,
             error_code=error_code,
             error_message=error_message,
         )

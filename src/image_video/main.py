@@ -11,9 +11,11 @@ from uuid import uuid4
 from fastapi import FastAPI, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from image_video.api.base import default_settings_store, router
+from image_video.api.errors import BusinessValidationError
 from image_video.api.history import router as history_router
 from image_video.api.image_jobs import router as image_jobs_router
 from image_video.api.media import router as media_router
@@ -22,7 +24,9 @@ from image_video.application.history import HistoryService
 from image_video.application.image_jobs import ImageJobService
 from image_video.application.video_projects import (
     FrameGenerator,
+    LazyFrameGenerator,
     LazyKeyframeGenerator,
+    MatscaFrameGenerator,
     MatscaKeyframeGenerator,
     VideoProjectService,
 )
@@ -31,6 +35,7 @@ from image_video.infrastructure.database.engine import (
     create_database_engine,
     initialize_database,
 )
+from image_video.infrastructure.database.media import MediaRepository
 from image_video.infrastructure.database.queue import JobQueue
 from image_video.infrastructure.providers.deepseek import DeepSeekPlanner
 from image_video.infrastructure.providers.matsca import (
@@ -52,19 +57,24 @@ def create_keyframe_generator(secrets: SecretSettings) -> MatscaKeyframeGenerato
     )
 
 
-def create_frame_generator(keyframe_generator: LazyKeyframeGenerator) -> FrameGenerator:
-    def generate_frame(
-        *,
-        frame: int,
-        prompt: str,
-        references: list[str],
-        previous_frame_path: str | None,
-        anchor_frame_paths: list[str],
-    ) -> bytes:
-        del frame, references, previous_frame_path, anchor_frame_paths
-        return keyframe_generator(prompt)
+def create_frame_generator(
+    secrets: SecretSettings, media: MediaRepository
+) -> FrameGenerator:
+    def load_references(media_ids: list[str]) -> list[bytes]:
+        return [Path(asset.path).read_bytes() for asset in media.by_ids(media_ids)]
 
-    return generate_frame
+    return LazyFrameGenerator(
+        lambda: MatscaFrameGenerator(
+            MatscaProvider(
+                MatscaCredentials(
+                    mode=MatscaMode.DIRECT,
+                    base_url=secrets.matsca_direct_base_url,
+                    api_key=secrets.matsca_direct_api_key,
+                )
+            ),
+            reference_loader=load_references,
+        )
+    )
 
 
 def run_ffmpeg(command: list[str]) -> None:
@@ -73,6 +83,7 @@ def run_ffmpeg(command: list[str]) -> None:
 
 def create_app(data_root: Path | None = None) -> FastAPI:
     root = data_root or Path("data")
+    frontend_root = Path(__file__).resolve().parents[2] / "frontend"
     engine = create_database_engine(root / "db" / "workbench.db")
 
     @asynccontextmanager
@@ -88,8 +99,9 @@ def create_app(data_root: Path | None = None) -> FastAPI:
     app.state.settings_store = default_settings_store(root)
     initialize_database(engine)
     app.state.job_queue = JobQueue(engine)
+    app.state.media_repository = MediaRepository(engine)
     app.state.image_job_service = ImageJobService(app.state.job_queue)
-    app.state.video_project_service = VideoProjectService(engine)
+    app.state.video_project_service = VideoProjectService(engine, data_root=root)
     app.state.history_service = HistoryService(engine, data_root=root)
     app.state.storyboard_planner = DeepSeekPlanner(
         api_key=app.state.secrets.deepseek_api_key,
@@ -99,13 +111,20 @@ def create_app(data_root: Path | None = None) -> FastAPI:
     app.state.keyframe_generator = LazyKeyframeGenerator(
         lambda: create_keyframe_generator(app.state.secrets)
     )
-    app.state.frame_generator = create_frame_generator(app.state.keyframe_generator)
+    app.state.frame_generator = create_frame_generator(
+        app.state.secrets, app.state.media_repository
+    )
     app.state.ffmpeg_runner = run_ffmpeg
     app.include_router(router)
     app.include_router(history_router)
     app.include_router(image_jobs_router)
     app.include_router(media_router)
     app.include_router(video_projects_router)
+    app.mount("/assets", StaticFiles(directory=frontend_root), name="frontend-assets")
+
+    @app.get("/", include_in_schema=False)
+    def frontend_index() -> FileResponse:  # pyright: ignore[reportUnusedFunction]
+        return FileResponse(frontend_root / "index.html")
 
     @app.exception_handler(RequestValidationError)
     async def validation_error_handler(  # pyright: ignore[reportUnusedFunction]
@@ -125,6 +144,50 @@ def create_app(data_root: Path | None = None) -> FastAPI:
                     "request_id": request_id,
                 }
             ),
+        )
+
+    def business_error_response(
+        request: Request, *, status_code: int, code: str, message: str
+    ) -> JSONResponse:
+        request_id = request.headers.get("X-Request-ID") or str(uuid4())
+        return JSONResponse(
+            status_code=status_code,
+            content={
+                "data": None,
+                "error": {"code": code, "message": message, "details": None},
+                "request_id": request_id,
+            },
+        )
+
+    @app.exception_handler(KeyError)
+    async def not_found_handler(  # pyright: ignore[reportUnusedFunction]
+        request: Request, exc: KeyError
+    ) -> JSONResponse:
+        del exc
+        return business_error_response(
+            request, status_code=404, code="NOT_FOUND", message="资源不存在"
+        )
+
+    @app.exception_handler(BusinessValidationError)
+    async def business_validation_handler(  # pyright: ignore[reportUnusedFunction]
+        request: Request, exc: BusinessValidationError
+    ) -> JSONResponse:
+        return business_error_response(
+            request,
+            status_code=422,
+            code="BUSINESS_VALIDATION_ERROR",
+            message=str(exc),
+        )
+
+    @app.exception_handler(ValueError)
+    async def state_conflict_handler(  # pyright: ignore[reportUnusedFunction]
+        request: Request, exc: ValueError
+    ) -> JSONResponse:
+        return business_error_response(
+            request,
+            status_code=409,
+            code="STATE_CONFLICT",
+            message=str(exc),
         )
 
     return app

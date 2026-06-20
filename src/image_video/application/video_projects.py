@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, Protocol, cast
@@ -88,6 +88,70 @@ class MatscaKeyframeImageProvider(Protocol):
     ) -> list[GeneratedImage]: ...
 
 
+class MatscaFrameImageProvider(Protocol):
+    def edit(
+        self,
+        *,
+        prompt: str,
+        images: list[bytes],
+        size: str,
+        quality: str,
+        output_format: str = "png",
+    ) -> list[GeneratedImage]: ...
+
+
+ReferenceLoader = Callable[[list[str]], list[bytes]]
+
+
+class MatscaFrameGenerator:
+    def __init__(
+        self,
+        provider: MatscaFrameImageProvider,
+        *,
+        reference_loader: ReferenceLoader,
+        downloader: ImageDownloader = download_image,
+    ):
+        self.provider = provider
+        self.reference_loader = reference_loader
+        self.downloader = downloader
+
+    def __call__(
+        self,
+        *,
+        frame: int,
+        prompt: str,
+        references: list[str],
+        previous_frame_path: str | None,
+        anchor_frame_paths: list[str],
+    ) -> bytes:
+        del frame
+        selected_paths: list[str] = []
+        start_anchor = anchor_frame_paths[0] if anchor_frame_paths else None
+        end_anchor = anchor_frame_paths[-1] if anchor_frame_paths else None
+        if previous_frame_path == start_anchor:
+            if start_anchor:
+                selected_paths.append(start_anchor)
+        else:
+            if end_anchor:
+                selected_paths.append(end_anchor)
+            if previous_frame_path and previous_frame_path not in selected_paths:
+                selected_paths.append(previous_frame_path)
+        images = [Path(path).read_bytes() for path in selected_paths]
+        images.extend(self.reference_loader(references[: 8 - len(images)]))
+        generated = self.provider.edit(
+            prompt=prompt,
+            images=images,
+            size="1024x1024",
+            quality="medium",
+            output_format="png",
+        )[0]
+        if generated.content is not None:
+            return generated.content
+        if generated.url is not None:
+            return self.downloader(generated.url)
+        raise ValueError("连续帧生成未返回 PNG 内容")
+
+
 class MatscaKeyframeGenerator:
     def __init__(
         self,
@@ -129,9 +193,36 @@ class LazyKeyframeGenerator:
         return self.factory()(prompt)
 
 
+class FrameGeneratorFactory(Protocol):
+    def __call__(self) -> FrameGenerator: ...
+
+
+class LazyFrameGenerator:
+    def __init__(self, factory: FrameGeneratorFactory):
+        self.factory = factory
+
+    def __call__(
+        self,
+        *,
+        frame: int,
+        prompt: str,
+        references: list[str],
+        previous_frame_path: str | None,
+        anchor_frame_paths: list[str],
+    ) -> bytes:
+        return self.factory()(
+            frame=frame,
+            prompt=prompt,
+            references=references,
+            previous_frame_path=previous_frame_path,
+            anchor_frame_paths=anchor_frame_paths,
+        )
+
+
 class VideoProjectService:
-    def __init__(self, engine: Engine):
+    def __init__(self, engine: Engine, *, data_root: Path = Path("data")):
         self.engine = engine
+        self.data_root = data_root
 
     def create_draft(self, request: VideoProjectDraftRequest) -> str:
         now = datetime.now(UTC)
@@ -215,9 +306,16 @@ class VideoProjectService:
             }
             session.commit()
 
-        plan = planner.create_storyboard(storyboard_request)
-        self._validate_storyboard(plan)
-        version_id = self.save_storyboard_version(project_id, source="ai", plan=plan)
+        try:
+            plan = planner.create_storyboard(storyboard_request)
+            self._validate_storyboard(plan)
+            version_id = self.save_storyboard_version(project_id, source="ai", plan=plan)
+        except TimeoutError:
+            self._set_project_status(project_id, "needs_attention")
+            raise
+        except Exception:
+            self._set_project_status(project_id, "failed")
+            raise
         with Session(self.engine) as session:
             project = session.get(VideoProject, project_id)
             if project is None:
@@ -226,6 +324,15 @@ class VideoProjectService:
             project.updated_at = datetime.now(UTC)
             session.commit()
         return version_id
+
+    def _set_project_status(self, project_id: str, status: str) -> None:
+        with Session(self.engine) as session:
+            project = session.get(VideoProject, project_id)
+            if project is None:
+                raise KeyError(project_id)
+            project.status = status
+            project.updated_at = datetime.now(UTC)
+            session.commit()
 
     def save_storyboard_version(
         self,
@@ -315,7 +422,7 @@ class VideoProjectService:
             session.execute(
                 delete(VideoKeyframe).where(VideoKeyframe.project_id == project_id)
             )
-            output_dir = Path("data") / "video_projects" / project_id / "keyframes"
+            output_dir = self.data_root / "video_projects" / project_id / "keyframes"
             output_dir.mkdir(parents=True, exist_ok=True)
             generated: list[dict[str, object]] = []
             for item in version.plan["keyframes"]:
@@ -432,7 +539,13 @@ class VideoProjectService:
                     .order_by(VideoReferenceImage.position)
                 ).all()
             ]
-            output_dir = Path("data") / "video_projects" / project_id / "frames"
+            existing_frames = {
+                video_frame.frame: video_frame
+                for video_frame in session.scalars(
+                    select(VideoFrame).where(VideoFrame.project_id == project_id)
+                ).all()
+            }
+            output_dir = self.data_root / "video_projects" / project_id / "frames"
             output_dir.mkdir(parents=True, exist_ok=True)
             generated: list[dict[str, object]] = []
             segments = self._storyboard_segments(version.plan)
@@ -449,6 +562,14 @@ class VideoProjectService:
                     frame = segment["start_frame"] + offset
                     if frame >= segment["end_frame"]:
                         continue
+                    existing = existing_frames.get(frame)
+                    if (
+                        existing is not None
+                        and existing.status == "completed"
+                        and Path(existing.path).is_file()
+                    ):
+                        previous_paths[index] = existing.path
+                        continue
                     anchor_frame_paths = [
                         path
                         for path in [
@@ -458,8 +579,8 @@ class VideoProjectService:
                         if path is not None
                     ]
                     path = output_dir / f"frame_{frame:06d}.png"
-                    path.write_bytes(
-                        generator(
+                    try:
+                        content = generator(
                             frame=frame,
                             prompt=segment["prompt"],
                             references=(
@@ -471,21 +592,44 @@ class VideoProjectService:
                             previous_frame_path=previous_paths[index],
                             anchor_frame_paths=anchor_frame_paths,
                         )
-                    )
-                    video_frame = VideoFrame(
+                    except TimeoutError:
+                        video_frame = existing or VideoFrame(
+                            id=str(uuid4()),
+                            project_id=project_id,
+                            frame=frame,
+                            created_at=now,
+                        )
+                        video_frame.segment_start_frame = segment["start_frame"]
+                        video_frame.segment_end_frame = segment["end_frame"]
+                        video_frame.prompt = segment["prompt"]
+                        video_frame.path = path.as_posix()
+                        video_frame.status = "needs_attention"
+                        video_frame.error_message = "上游请求超时，结果状态不确定"
+                        video_frame.updated_at = now
+                        if existing is None:
+                            session.add(video_frame)
+                            existing_frames[frame] = video_frame
+                        project.status = "needs_attention"
+                        project.updated_at = now
+                        session.commit()
+                        raise
+                    path.write_bytes(content)
+                    video_frame = existing or VideoFrame(
                         id=str(uuid4()),
                         project_id=project_id,
                         frame=frame,
-                        segment_start_frame=segment["start_frame"],
-                        segment_end_frame=segment["end_frame"],
-                        prompt=segment["prompt"],
-                        path=path.as_posix(),
-                        status="completed",
-                        error_message="",
                         created_at=now,
-                        updated_at=now,
                     )
-                    session.add(video_frame)
+                    video_frame.segment_start_frame = segment["start_frame"]
+                    video_frame.segment_end_frame = segment["end_frame"]
+                    video_frame.prompt = segment["prompt"]
+                    video_frame.path = path.as_posix()
+                    video_frame.status = "completed"
+                    video_frame.error_message = ""
+                    video_frame.updated_at = now
+                    if existing is None:
+                        session.add(video_frame)
+                        existing_frames[frame] = video_frame
                     previous_paths[index] = video_frame.path
                     generated.append(
                         {
@@ -578,6 +722,12 @@ class VideoProjectService:
             if project is None:
                 raise KeyError(project_id)
             project.status = "stitching"
+            version_id = project.settings.get("approved_storyboard_version_id")
+            if not isinstance(version_id, str):
+                raise ValueError("缺失已确认的分镜版本")
+            version = session.get(VideoStoryboardVersion, version_id)
+            if version is None or version.project_id != project_id:
+                raise ValueError("缺失已确认的分镜版本")
             keyframes = session.scalars(
                 select(VideoKeyframe)
                 .where(VideoKeyframe.project_id == project_id)
@@ -591,6 +741,24 @@ class VideoProjectService:
             incomplete = [frame for frame in frames if frame.status != "completed"]
             if incomplete:
                 raise ValueError("存在未完成或需人工处理的帧")
+            paths_by_frame = {
+                frame.frame: frame.path
+                for frame in [*keyframes, *frames]
+                if frame.status == "completed"
+            }
+            required_frames = {
+                frame
+                for segment in self._storyboard_segments(version.plan)
+                for frame in range(segment["start_frame"], segment["end_frame"] + 1)
+            }
+            missing_frames = sorted(
+                frame
+                for frame in required_frames
+                if frame not in paths_by_frame
+                or not Path(paths_by_frame[frame]).is_file()
+            )
+            if missing_frames:
+                raise ValueError(f"存在缺失帧：{missing_frames}")
             all_frames = sorted(
                 [(frame.frame, frame.path) for frame in keyframes]
                 + [(frame.frame, frame.path) for frame in frames],
@@ -598,7 +766,7 @@ class VideoProjectService:
             )
             if not all_frames:
                 raise ValueError("没有可合成的帧")
-            output_dir = Path("data") / "video_projects" / project_id / "output"
+            output_dir = self.data_root / "video_projects" / project_id / "output"
             output_dir.mkdir(parents=True, exist_ok=True)
             concat_path = output_dir / "frames.txt"
             concat_path.write_text(

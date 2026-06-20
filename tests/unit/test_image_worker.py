@@ -11,6 +11,7 @@ from image_video.infrastructure.database.queue import JobQueue
 from image_video.infrastructure.providers.dashscope import DashScopeResult
 from image_video.infrastructure.providers.matsca import GeneratedImage
 from image_video.worker.image_handler import ImageJobHandler
+from image_video.worker.runner import WorkerRunner
 
 
 def png_bytes() -> bytes:
@@ -188,3 +189,36 @@ def test_image_handler_runs_legacy_dashscope_model(tmp_path: Path) -> None:
 
     assert queue.get(job_id).status == JobStatus.COMPLETED
     assert len(MediaRepository(engine).for_job(job_id)) == 1
+
+
+def test_image_worker_does_not_persist_result_after_pause(tmp_path: Path) -> None:
+    engine = create_database_engine(tmp_path / "workbench.db")
+    initialize_database(engine)
+    queue = JobQueue(engine)
+    media = MediaRepository(engine)
+    job_id = ImageJobService(queue).submit(
+        ImageJobRequest(model="gpt-image-2", prompt="cat")
+    )
+
+    class PausingProvider(FakeMatscaProvider):
+        def generate(self, **kwargs: object) -> list[GeneratedImage]:
+            del kwargs
+            queue.pause(job_id)
+            return [GeneratedImage(content=png_bytes())]
+
+    handler = ImageJobHandler(
+        queue=queue,
+        media=media,
+        output_root=tmp_path / "outputs",
+        matsca_provider=lambda mode: PausingProvider(),
+    )
+    runner = WorkerRunner(
+        queue=queue,
+        handlers={"image.generate": handler},
+        worker_id="worker-a",
+    )
+
+    assert runner.run_once()
+
+    assert queue.get(job_id).status == JobStatus.PAUSED
+    assert media.for_job(job_id) == []

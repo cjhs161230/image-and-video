@@ -1,0 +1,115 @@
+:root {
+  color-scheme: dark;
+  font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
+  background: #101315;
+  color: #edf1f2;
+}
+
+body {
+  margin: 0;
+}
+
+main {
+  width: min(960px, calc(100% - 32px));
+  margin: 0 auto;
+  padding: 48px 0;
+}
+
+header,
+section {
+  padding: 24px;
+  margin-bottom: 20px;
+  background: #191e21;
+  border: 1px solid #30383d;
+  border-radius: 16px;
+}
+
+.eyebrow {
+  color: #75d6b3;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+}
+
+nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin: 20px 0;
+}
+
+nav a {
+  color: #75d6b3;
+}
+
+label {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+textarea,
+select,
+input,
+button {
+  font: inherit;
+}
+
+textarea,
+select,
+input {
+  box-sizing: border-box;
+  width: 100%;
+  padding: 10px 12px;
+  color: inherit;
+  background: #111517;
+  border: 1px solid #3b464c;
+  border-radius: 8px;
+}
+
+textarea {
+  min-height: 120px;
+  resize: vertical;
+}
+
+button {
+  padding: 10px 16px;
+  color: #0c1713;
+  background: #75d6b3;
+  border: 0;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.form-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 12px;
+}
+
+.job-panel {
+  margin-top: 24px;
+  padding: 16px;
+  background: #111517;
+  border-radius: 12px;
+}
+
+.controls {
+  display: flex;
+  gap: 8px;
+  margin: 16px 0;
+}
+
+.results {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+}
+
+.results img {
+  width: 100%;
+  border-radius: 10px;
+}
+
+#job-error {
+  color: #ff9c9c;
+}

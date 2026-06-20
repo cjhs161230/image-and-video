@@ -31,9 +31,9 @@ class HistoryService:
                     {
                         "id": asset.id,
                         "kind": "image",
-                        "path": asset.path,
-                        "thumbnail_path": asset.thumbnail_path,
-                        "cover_path": asset.thumbnail_path,
+                        "media_url": f"/api/v1/media/{asset.id}",
+                        "thumbnail_url": f"/api/v1/media/{asset.id}",
+                        "cover_url": f"/api/v1/media/{asset.id}",
                         "created_at": asset.created_at.isoformat(),
                         "log_summary": "状态：completed",
                     }
@@ -49,9 +49,9 @@ class HistoryService:
                     {
                         "id": project.id,
                         "kind": "video",
-                        "path": project.settings.get("output_video_path", ""),
-                        "thumbnail_path": "",
-                        "cover_path": project.settings.get("output_video_path", ""),
+                        "media_url": "",
+                        "thumbnail_url": "",
+                        "cover_url": "",
                         "created_at": project.updated_at.isoformat(),
                         "log_summary": f"状态：{project.status}",
                     }
@@ -64,14 +64,7 @@ class HistoryService:
             asset = session.get(MediaAsset, media_id)
             if asset is None:
                 return None
-            path = Path(asset.path).resolve()
-            if not path.is_file():
-                return None
-            try:
-                path.relative_to(self.data_root)
-            except ValueError:
-                return None
-            return path
+            return self._safe_data_file(asset.path)
 
     def delete_media(
         self,
@@ -87,14 +80,15 @@ class HistoryService:
             asset = session.get(MediaAsset, media_id)
             if asset is None:
                 return {"id": media_id, "status": "missing"}
-            paths = {
-                path
-                for path in [
-                    self.resolve_media_path(asset.id),
-                    Path(asset.thumbnail_path).resolve(),
-                ]
-                if path is not None
-            }
+            media_path = self._safe_data_file(asset.path)
+            thumbnail_path = self._safe_data_file(asset.thumbnail_path)
+            if media_path is None or thumbnail_path is None:
+                return {
+                    "id": media_id,
+                    "status": "partial_failed",
+                    "error": "媒体文件路径不安全或文件不存在",
+                }
+            paths = {media_path, thumbnail_path}
             try:
                 for path in paths:
                     if path.exists():
@@ -108,3 +102,13 @@ class HistoryService:
             session.delete(asset)
             session.commit()
             return {"id": media_id, "status": "deleted"}
+
+    def _safe_data_file(self, value: str) -> Path | None:
+        path = Path(value).resolve()
+        if not path.is_file():
+            return None
+        try:
+            path.relative_to(self.data_root)
+        except ValueError:
+            return None
+        return path

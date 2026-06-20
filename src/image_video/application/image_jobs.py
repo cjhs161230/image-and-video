@@ -4,6 +4,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from image_video.api.errors import BusinessValidationError
 from image_video.infrastructure.database.queue import JobQueue
 
 SUPPORTED_IMAGE_MODELS = {
@@ -35,10 +36,9 @@ class ImageJobService:
 
     def submit(self, request: ImageJobRequest) -> str:
         if request.model not in SUPPORTED_IMAGE_MODELS:
-            raise ValueError(f"不支持的模型：{request.model}")
+            raise BusinessValidationError(f"不支持的模型：{request.model}")
         if request.model == "gpt-image-2" and not 1 <= request.n <= 4:
-            raise ValueError("GPT-Image-2 单次输出数量必须为 1 到 4")
+            raise BusinessValidationError("GPT-Image-2 单次输出数量必须为 1 到 4")
         if request.model == "gpt-image-2" and len(request.input_media_ids) > 8:
-            raise ValueError("GPT-Image-2 最多 8 张输入图片")
+            raise BusinessValidationError("GPT-Image-2 最多 8 张输入图片")
         return self.queue.enqueue("image.generate", request.model_dump())
-
