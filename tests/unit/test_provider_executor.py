@@ -1,8 +1,11 @@
+import json
 import threading
+from pathlib import Path
 
 import httpx
 import pytest
 
+from image_video.infrastructure.logging import JsonlLogger
 from image_video.infrastructure.providers.executor import (
     CredentialGate,
     ProviderRequestExecutor,
@@ -106,3 +109,29 @@ def test_credential_gate_never_exceeds_current_limit() -> None:
     first_thread.join(timeout=2)
     second_thread.join(timeout=2)
 
+
+def test_credential_gate_allows_reentrant_slot_on_same_thread() -> None:
+    gate = CredentialGate(AdaptiveLimiter(max_concurrency=2, current_limit=1))
+
+    with gate.slot(), gate.slot():
+        assert gate.limiter.current_limit == 1
+
+
+def test_provider_executor_writes_structured_success_event(tmp_path: Path) -> None:
+    log_path = tmp_path / "provider.jsonl"
+    executor = ProviderRequestExecutor(
+        gate=CredentialGate(AdaptiveLimiter(max_concurrency=2)),
+        sleep=lambda _: None,
+        jitter=lambda: 0,
+        logger=JsonlLogger(log_path),
+        provider="matsca",
+    )
+
+    assert executor.run(lambda: "ok", request_id="task-1") == "ok"
+
+    [record] = [
+        json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert record["event"] == "provider_request_succeeded"
+    assert record["request_id"] == "task-1"
+    assert record["data"] == {"provider": "matsca", "attempt": 1}

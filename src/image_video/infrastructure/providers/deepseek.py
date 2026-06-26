@@ -11,6 +11,7 @@ import httpx
 from pydantic import BaseModel, Field
 
 from image_video.infrastructure.config import normalize_api_base_url
+from image_video.infrastructure.providers.executor import ProviderRequestExecutor
 
 
 class StoryboardKeyframe(BaseModel):
@@ -43,15 +44,17 @@ class DeepSeekPlanner:
         model: str,
         sleep: Callable[[float], None] = time.sleep,
         client: httpx.Client | None = None,
+        request_executor: ProviderRequestExecutor | None = None,
     ):
         self.api_key = api_key
         self.base_url = normalize_api_base_url(base_url)
         self.model = model
         self.sleep = sleep
         self.client = client or httpx.Client(timeout=120)
+        self.request_executor = request_executor
 
     def create_storyboard(self, request: dict[str, Any]) -> StoryboardPlan:
-        response = self._post_with_retry(
+        return self._request_storyboard(
             {
                 "model": self.model,
                 "temperature": 0.3,
@@ -62,21 +65,42 @@ class DeepSeekPlanner:
                 ],
             }
         )
+
+    def review_storyboard(self, request: dict[str, Any]) -> StoryboardPlan:
+        return self._request_storyboard(
+            {
+                "model": self.model,
+                "temperature": 0.2,
+                "response_format": {"type": "json_object"},
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "你是视频分镜复审器。检查给定分镜的连续性、关键帧边界、"
+                            "角色场景一致性和运动描述，并输出修订后的完整严格 JSON object。"
+                            + self._schema_prompt()
+                        ),
+                    },
+                    {"role": "user", "content": json.dumps(request, ensure_ascii=False)},
+                ],
+            }
+        )
+
+    def _request_storyboard(self, payload: dict[str, Any]) -> StoryboardPlan:
+        response = self._post_with_retry(payload)
         payload = response.json()
         content = payload["choices"][0]["message"]["content"]
         return StoryboardPlan.model_validate_json(content)
 
     def _post_with_retry(self, payload: dict[str, Any]) -> httpx.Response:
+        if self.request_executor is not None:
+            return self.request_executor.run(
+                lambda: self._post_once(payload),
+                request_id="deepseek",
+            )
         last_response: httpx.Response | None = None
         for attempt in range(3):
-            response = self.client.post(
-                f"{self.base_url}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-            )
+            response = self._post_once(payload, raise_for_status=False)
             last_response = response
             if response.status_code < 500 and response.status_code != 429:
                 response.raise_for_status()
@@ -88,10 +112,31 @@ class DeepSeekPlanner:
         last_response.raise_for_status()
         raise RuntimeError("unreachable")
 
+    def _post_once(
+        self, payload: dict[str, Any], *, raise_for_status: bool = True
+    ) -> httpx.Response:
+        response = self.client.post(
+            f"{self.base_url}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+        )
+        if raise_for_status:
+            response.raise_for_status()
+        return response
+
     @staticmethod
     def _system_prompt() -> str:
         return (
             "你是视频分镜规划器。只输出严格 JSON object，不要输出 Markdown。"
+            + DeepSeekPlanner._schema_prompt()
+        )
+
+    @staticmethod
+    def _schema_prompt() -> str:
+        return (
             "JSON 必须包含 global_prompt、"
             "character_lock、scene_lock、camera_lock、keyframes 和 segments。"
             "keyframes 包含 frame、description、prompt；segments 包含 "

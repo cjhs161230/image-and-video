@@ -2,16 +2,23 @@
 
 from __future__ import annotations
 
+import inspect
+import time
 from collections.abc import Callable, Mapping
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import nullcontext
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import Lock
 from typing import Any, Literal, Protocol, cast
 from uuid import uuid4
 
+import httpx
 from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import Engine, delete, func, select
 from sqlalchemy.orm import Session
 
+from image_video.application.image_assets import save_image_atomic
 from image_video.infrastructure.database.models import (
     VideoFrame,
     VideoKeyframe,
@@ -21,7 +28,7 @@ from image_video.infrastructure.database.models import (
 )
 from image_video.infrastructure.providers.deepseek import StoryboardPlan
 from image_video.infrastructure.providers.download import download_image
-from image_video.infrastructure.providers.matsca import GeneratedImage
+from image_video.infrastructure.providers.matsca import GeneratedImage, MatscaImageTask
 
 ReferenceLabel = Literal["角色", "场景", "风格"]
 
@@ -35,6 +42,10 @@ class VideoReferenceImageInput(BaseModel):
 class VideoProjectDraftRequest(BaseModel):
     title: str
     description: str
+    start_frame: int = Field(default=0, ge=0)
+    end_frame: int | None = Field(default=None, ge=0)
+    total_frames: int | None = Field(default=None, ge=1)
+    fps: int = Field(default=24, ge=1, le=60)
     reference_images: list[VideoReferenceImageInput] = Field(
         default_factory=list[VideoReferenceImageInput]
     )
@@ -43,11 +54,24 @@ class VideoProjectDraftRequest(BaseModel):
     def validate_reference_count(self) -> VideoProjectDraftRequest:
         if len(self.reference_images) > 8:
             raise ValueError("最多 8 张参考图")
+        if self.total_frames is not None:
+            self.end_frame = self.start_frame + self.total_frames - 1
+        elif self.end_frame is None:
+            self.end_frame = self.start_frame
+            self.total_frames = 1
+        else:
+            if self.end_frame < self.start_frame:
+                raise ValueError("结束帧不能小于起始帧")
+            self.total_frames = self.end_frame - self.start_frame + 1
         return self
 
 
 class StoryboardPlanner(Protocol):
-    def create_storyboard(self, request: Mapping[str, object]) -> StoryboardPlan: ...
+    def create_storyboard(self, request: dict[str, Any]) -> StoryboardPlan: ...
+
+
+class StoryboardReviewer(Protocol):
+    def review_storyboard(self, request: dict[str, Any]) -> StoryboardPlan: ...
 
 
 class KeyframeGenerator(Protocol):
@@ -75,6 +99,8 @@ class FfmpegRunner(Protocol):
 
 
 class MatscaKeyframeImageProvider(Protocol):
+    def task_slot(self) -> object: ...
+
     def generate(
         self,
         *,
@@ -87,8 +113,25 @@ class MatscaKeyframeImageProvider(Protocol):
         output_format: str = "png",
     ) -> list[GeneratedImage]: ...
 
+    def create_generation_task(
+        self,
+        *,
+        prompt: str,
+        size: str,
+        quality: str,
+        style: str,
+        n: int,
+        background: str = "auto",
+        output_format: str = "png",
+        client_task_id: str | None = None,
+    ) -> MatscaImageTask: ...
+
+    def get_image_task(self, task_id: str) -> MatscaImageTask: ...
+
 
 class MatscaFrameImageProvider(Protocol):
+    def task_slot(self) -> object: ...
+
     def edit(
         self,
         *,
@@ -99,8 +142,38 @@ class MatscaFrameImageProvider(Protocol):
         output_format: str = "png",
     ) -> list[GeneratedImage]: ...
 
+    def create_edit_task(
+        self,
+        *,
+        prompt: str,
+        images: list[bytes],
+        size: str,
+        quality: str,
+        output_format: str = "png",
+        client_task_id: str | None = None,
+    ) -> MatscaImageTask: ...
+
+    def get_image_task(self, task_id: str) -> MatscaImageTask: ...
+
 
 ReferenceLoader = Callable[[list[str]], list[bytes]]
+
+
+def _requires_same_client_task_resubmit(error: str | None) -> bool:
+    if not error:
+        return False
+    return "client_task_id" in error and ("重启" in error or "中断" in error)
+
+
+def _accepts_keyword(callable_obj: Any, keyword: str) -> bool:
+    try:
+        signature = inspect.signature(callable_obj)
+    except (TypeError, ValueError):
+        return True
+    return keyword in signature.parameters or any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    )
 
 
 class MatscaFrameGenerator:
@@ -110,10 +183,14 @@ class MatscaFrameGenerator:
         *,
         reference_loader: ReferenceLoader,
         downloader: ImageDownloader = download_image,
+        poll_interval: float = 2,
+        poll_timeout: float = 600,
     ):
         self.provider = provider
         self.reference_loader = reference_loader
         self.downloader = downloader
+        self.poll_interval = poll_interval
+        self.poll_timeout = poll_timeout
 
     def __call__(
         self,
@@ -125,19 +202,11 @@ class MatscaFrameGenerator:
         anchor_frame_paths: list[str],
     ) -> bytes:
         del frame
-        selected_paths: list[str] = []
-        start_anchor = anchor_frame_paths[0] if anchor_frame_paths else None
-        end_anchor = anchor_frame_paths[-1] if anchor_frame_paths else None
-        if previous_frame_path == start_anchor:
-            if start_anchor:
-                selected_paths.append(start_anchor)
-        else:
-            if end_anchor:
-                selected_paths.append(end_anchor)
-            if previous_frame_path and previous_frame_path not in selected_paths:
-                selected_paths.append(previous_frame_path)
-        images = [Path(path).read_bytes() for path in selected_paths]
-        images.extend(self.reference_loader(references[: 8 - len(images)]))
+        images = self._input_images(
+            references=references,
+            previous_frame_path=previous_frame_path,
+            anchor_frame_paths=anchor_frame_paths,
+        )
         generated = self.provider.edit(
             prompt=prompt,
             images=images,
@@ -151,6 +220,95 @@ class MatscaFrameGenerator:
             return self.downloader(generated.url)
         raise ValueError("连续帧生成未返回 PNG 内容")
 
+    def generate(
+        self,
+        *,
+        frame: int,
+        prompt: str,
+        references: list[str],
+        previous_frame_path: str | None,
+        anchor_frame_paths: list[str],
+        task_id: str | None,
+        client_task_id: str | None = None,
+        on_task_created: Callable[[str], None],
+        on_result_url: Callable[[str], None] | None = None,
+    ) -> bytes:
+        del frame
+        slot = getattr(self.provider, "task_slot", nullcontext)
+        with slot():
+            images = self._input_images(
+                references=references,
+                previous_frame_path=previous_frame_path,
+                anchor_frame_paths=anchor_frame_paths,
+            )
+            if task_id is None:
+                task = self.provider.create_edit_task(
+                    prompt=prompt,
+                    images=images,
+                    size="1024x1024",
+                    quality="medium",
+                    output_format="png",
+                    client_task_id=client_task_id,
+                )
+                task_id = task.id
+                on_task_created(task_id)
+            recreated_interrupted_task = False
+            deadline = time.monotonic() + self.poll_timeout
+            while True:
+                task = self.provider.get_image_task(task_id)
+                if task.status in {"completed", "succeeded", "success"} and task.images:
+                    image = task.images[0]
+                    if image.content is not None:
+                        return image.content
+                    if image.url is not None:
+                        if on_result_url is not None:
+                            on_result_url(image.url)
+                        return self.downloader(image.url)
+                    raise ValueError("direct 异步连续帧未返回 b64_json/url 图片")
+                if task.status in {"failed", "error", "cancelled"}:
+                    if (
+                        not recreated_interrupted_task
+                        and _requires_same_client_task_resubmit(task.error)
+                    ):
+                        task = self.provider.create_edit_task(
+                            prompt=prompt,
+                            images=images,
+                            size="1024x1024",
+                            quality="medium",
+                            output_format="png",
+                            client_task_id=task_id,
+                        )
+                        task_id = task.id
+                        on_task_created(task_id)
+                        recreated_interrupted_task = True
+                        continue
+                    raise ValueError(task.error or f"Matsca 异步图片任务失败: {task.status}")
+                if time.monotonic() >= deadline:
+                    raise httpx.ReadTimeout("Matsca 异步连续帧轮询超时")
+                time.sleep(self.poll_interval)
+
+    def _input_images(
+        self,
+        *,
+        references: list[str],
+        previous_frame_path: str | None,
+        anchor_frame_paths: list[str],
+    ) -> list[bytes]:
+        selected_paths: list[str] = []
+        start_anchor = anchor_frame_paths[0] if anchor_frame_paths else None
+        end_anchor = anchor_frame_paths[-1] if anchor_frame_paths else None
+        if previous_frame_path == start_anchor:
+            if start_anchor:
+                selected_paths.append(start_anchor)
+        else:
+            if end_anchor:
+                selected_paths.append(end_anchor)
+            if previous_frame_path and previous_frame_path not in selected_paths:
+                selected_paths.append(previous_frame_path)
+        images = [Path(path).read_bytes() for path in selected_paths]
+        images.extend(self.reference_loader(references[: 8 - len(images)]))
+        return images
+
 
 class MatscaKeyframeGenerator:
     def __init__(
@@ -158,9 +316,13 @@ class MatscaKeyframeGenerator:
         provider: MatscaKeyframeImageProvider,
         *,
         downloader: ImageDownloader = download_image,
+        poll_interval: float = 2,
+        poll_timeout: float = 600,
     ):
         self.provider = provider
         self.downloader = downloader
+        self.poll_interval = poll_interval
+        self.poll_timeout = poll_timeout
 
     def __call__(self, prompt: str) -> bytes:
         images = self.provider.generate(
@@ -179,6 +341,47 @@ class MatscaKeyframeGenerator:
         if image.content is None:
             raise ValueError("关键帧生成未返回 PNG 内容")
         raise RuntimeError("unreachable")
+
+    def generate(
+        self,
+        prompt: str,
+        *,
+        task_id: str | None,
+        client_task_id: str | None = None,
+        on_task_created: Callable[[str], None],
+        on_result_url: Callable[[str], None] | None = None,
+    ) -> bytes:
+        slot = getattr(self.provider, "task_slot", nullcontext)
+        with slot():
+            if task_id is None:
+                task = self.provider.create_generation_task(
+                    prompt=prompt,
+                    size="1024x1024",
+                    quality="medium",
+                    style="natural",
+                    n=1,
+                    output_format="png",
+                    client_task_id=client_task_id,
+                )
+                task_id = task.id
+                on_task_created(task_id)
+            deadline = time.monotonic() + self.poll_timeout
+            while True:
+                task = self.provider.get_image_task(task_id)
+                if task.status in {"completed", "succeeded", "success"} and task.images:
+                    image = task.images[0]
+                    if image.content is not None:
+                        return image.content
+                    if image.url is not None:
+                        if on_result_url is not None:
+                            on_result_url(image.url)
+                        return self.downloader(image.url)
+                    raise ValueError("direct 异步关键帧未返回 b64_json/url 图片")
+                if task.status in {"failed", "error", "cancelled"}:
+                    raise ValueError(task.error or f"Matsca 异步图片任务失败: {task.status}")
+                if time.monotonic() >= deadline:
+                    raise httpx.ReadTimeout("Matsca 异步关键帧轮询超时")
+                time.sleep(self.poll_interval)
 
 
 class KeyframeGeneratorFactory(Protocol):
@@ -220,9 +423,16 @@ class LazyFrameGenerator:
 
 
 class VideoProjectService:
-    def __init__(self, engine: Engine, *, data_root: Path = Path("data")):
+    def __init__(
+        self,
+        engine: Engine,
+        *,
+        data_root: Path = Path("data"),
+        validate_image_saves: bool = True,
+    ):
         self.engine = engine
         self.data_root = data_root
+        self.validate_image_saves = validate_image_saves
 
     def create_draft(self, request: VideoProjectDraftRequest) -> str:
         now = datetime.now(UTC)
@@ -234,7 +444,12 @@ class VideoProjectService:
                     title=request.title,
                     description=request.description,
                     status="draft",
-                    settings={},
+                    settings={
+                        "start_frame": request.start_frame,
+                        "end_frame": request.end_frame,
+                        "total_frames": request.total_frames,
+                        "fps": request.fps,
+                    },
                     created_at=now,
                     updated_at=now,
                 )
@@ -266,6 +481,13 @@ class VideoProjectService:
                 raise ValueError("只有草稿状态可自动保存")
             project.title = request.title
             project.description = request.description
+            project.settings = {
+                **project.settings,
+                "start_frame": request.start_frame,
+                "end_frame": request.end_frame,
+                "total_frames": request.total_frames,
+                "fps": request.fps,
+            }
             project.updated_at = now
             session.execute(
                 delete(VideoReferenceImage).where(
@@ -290,25 +512,118 @@ class VideoProjectService:
                 "status": project.status,
                 "title": project.title,
                 "reference_count": len(request.reference_images),
+                "start_frame": request.start_frame,
+                "end_frame": request.end_frame,
+                "total_frames": request.total_frames,
+                "fps": request.fps,
             }
 
-    def generate_storyboard(self, project_id: str, planner: StoryboardPlanner) -> str:
+    def get_project_summary(self, project_id: str) -> dict[str, object]:
+        with Session(self.engine) as session:
+            project = session.get(VideoProject, project_id)
+            if project is None:
+                raise KeyError(project_id)
+            keyframe_count = session.scalar(
+                select(func.count())
+                .select_from(VideoKeyframe)
+                .where(VideoKeyframe.project_id == project_id)
+            )
+            frame_rows = session.scalars(
+                select(VideoFrame).where(VideoFrame.project_id == project_id)
+            ).all()
+            frame_stats: dict[str, int] = {}
+            for frame in frame_rows:
+                frame_stats[frame.status] = frame_stats.get(frame.status, 0) + 1
+            try:
+                frame_issue_count = len(self.list_frame_issues(project_id))
+            except ValueError:
+                frame_issue_count = 0
+            return {
+                "project_id": project.id,
+                "title": project.title,
+                "description": project.description,
+                "status": project.status,
+                "start_frame": project.settings.get("start_frame", 0),
+                "end_frame": project.settings.get("end_frame", 0),
+                "total_frames": project.settings.get("total_frames", 0),
+                "fps": project.settings.get("fps", 24),
+                "keyframe_count": keyframe_count or 0,
+                "frame_stats": frame_stats,
+                "frame_issue_count": frame_issue_count,
+                "created_at": project.created_at.isoformat(),
+                "updated_at": project.updated_at.isoformat(),
+            }
+
+    def request_storyboard_generation(self, project_id: str, enqueue: Callable[[], str]) -> str:
+        with Session(self.engine) as session:
+            project = session.get(VideoProject, project_id)
+            if project is None:
+                raise KeyError(project_id)
+            if project.status not in {"draft", "failed", "needs_attention"}:
+                raise ValueError("当前状态不能生成分镜")
+            project.status = "planning"
+            project.updated_at = datetime.now(UTC)
+            session.commit()
+        return enqueue()
+
+    def request_storyboard_review(
+        self,
+        project_id: str,
+        *,
+        version_id: str,
+        enqueue: Callable[[], str],
+    ) -> str:
+        with Session(self.engine) as session:
+            project = session.get(VideoProject, project_id)
+            if project is None:
+                raise KeyError(project_id)
+            version = session.get(VideoStoryboardVersion, version_id)
+            if version is None or version.project_id != project_id:
+                raise KeyError(version_id)
+            if project.status not in {
+                "draft",
+                "awaiting_storyboard_approval",
+                "failed",
+                "needs_attention",
+            }:
+                raise ValueError("当前状态不能复审分镜")
+            project.status = "planning"
+            project.updated_at = datetime.now(UTC)
+            session.commit()
+        return enqueue()
+
+    def generate_storyboard(
+        self,
+        project_id: str,
+        planner: StoryboardPlanner,
+        *,
+        on_upstream_request_sent: Callable[[], None] | None = None,
+        can_persist: Callable[[], bool] | None = None,
+    ) -> str:
         with Session(self.engine) as session:
             project = session.get(VideoProject, project_id)
             if project is None:
                 raise KeyError(project_id)
             project.status = "planning"
             project.updated_at = datetime.now(UTC)
-            storyboard_request: Mapping[str, object] = {
+            storyboard_request: dict[str, Any] = {
                 "title": project.title,
                 "description": project.description,
+                "start_frame": project.settings.get("start_frame", 0),
+                "end_frame": project.settings.get("end_frame", 0),
+                "total_frames": project.settings.get("total_frames", 1),
+                "fps": project.settings.get("fps", 24),
                 "references": self._reference_labels(session, project_id),
             }
             session.commit()
 
         try:
+            if on_upstream_request_sent is not None:
+                on_upstream_request_sent()
             plan = planner.create_storyboard(storyboard_request)
             self._validate_storyboard(plan)
+            if can_persist is not None and not can_persist():
+                return ""
             version_id = self.save_storyboard_version(project_id, source="ai", plan=plan)
         except TimeoutError:
             self._set_project_status(project_id, "needs_attention")
@@ -316,6 +631,8 @@ class VideoProjectService:
         except Exception:
             self._set_project_status(project_id, "failed")
             raise
+        if can_persist is not None and not can_persist():
+            return ""
         with Session(self.engine) as session:
             project = session.get(VideoProject, project_id)
             if project is None:
@@ -324,6 +641,59 @@ class VideoProjectService:
             project.updated_at = datetime.now(UTC)
             session.commit()
         return version_id
+
+    def review_storyboard(
+        self,
+        project_id: str,
+        *,
+        version_id: str,
+        reviewer: StoryboardReviewer,
+        on_upstream_request_sent: Callable[[], None] | None = None,
+        can_persist: Callable[[], bool] | None = None,
+    ) -> str:
+        with Session(self.engine) as session:
+            project = session.get(VideoProject, project_id)
+            if project is None:
+                raise KeyError(project_id)
+            version = session.get(VideoStoryboardVersion, version_id)
+            if version is None or version.project_id != project_id:
+                raise KeyError(version_id)
+            review_request: dict[str, Any] = {
+                "project": {
+                    "title": project.title,
+                    "description": project.description,
+                    "start_frame": project.settings.get("start_frame", 0),
+                    "end_frame": project.settings.get("end_frame", 0),
+                    "total_frames": project.settings.get("total_frames", 1),
+                    "fps": project.settings.get("fps", 24),
+                    "references": self._reference_labels(session, project_id),
+                },
+                "storyboard": version.plan,
+            }
+
+        try:
+            if on_upstream_request_sent is not None:
+                on_upstream_request_sent()
+            plan = reviewer.review_storyboard(review_request)
+            self._validate_storyboard(plan)
+            if can_persist is not None and not can_persist():
+                return ""
+            reviewed_id = self.save_storyboard_version(
+                project_id,
+                source="ai",
+                plan=plan,
+                suggestion="DeepSeek 独立复审",
+            )
+        except TimeoutError:
+            self._set_project_status(project_id, "needs_attention")
+            raise
+        except Exception:
+            self._set_project_status(project_id, "failed")
+            raise
+        if can_persist is not None and not can_persist():
+            return ""
+        self._set_project_status(project_id, "awaiting_storyboard_approval")
+        return reviewed_id
 
     def _set_project_status(self, project_id: str, status: str) -> None:
         with Session(self.engine) as session:
@@ -402,8 +772,24 @@ class VideoProjectService:
             project.updated_at = datetime.now(UTC)
             session.commit()
 
+    def request_keyframe_generation(self, project_id: str, enqueue: Callable[[], str]) -> str:
+        with Session(self.engine) as session:
+            project = session.get(VideoProject, project_id)
+            if project is None:
+                raise KeyError(project_id)
+            if project.status != "generating_keyframes":
+                raise ValueError("只有关键帧生成状态可生成关键帧")
+            project.updated_at = datetime.now(UTC)
+            session.commit()
+        return enqueue()
+
     def generate_keyframes(
-        self, project_id: str, generator: KeyframeGenerator
+        self,
+        project_id: str,
+        generator: KeyframeGenerator | Any,
+        *,
+        can_persist: Callable[[], bool] | None = None,
+        on_upstream_request_sent: Callable[[], None] | None = None,
     ) -> list[dict[str, object]]:
         now = datetime.now(UTC)
         with Session(self.engine) as session:
@@ -418,46 +804,206 @@ class VideoProjectService:
             version = session.get(VideoStoryboardVersion, version_id)
             if version is None or version.project_id != project_id:
                 raise KeyError(project_id)
-
+            keyframe_plan = [
+                {
+                    "frame": int(item["frame"]),
+                    "prompt": str(item["prompt"]),
+                    "description": str(item.get("description", "")),
+                }
+                for item in version.plan["keyframes"]
+            ]
             session.execute(
-                delete(VideoKeyframe).where(VideoKeyframe.project_id == project_id)
+                delete(VideoKeyframe).where(
+                    VideoKeyframe.project_id == project_id,
+                    VideoKeyframe.storyboard_version_id != version_id,
+                )
             )
             output_dir = self.data_root / "video_projects" / project_id / "keyframes"
             output_dir.mkdir(parents=True, exist_ok=True)
-            generated: list[dict[str, object]] = []
-            for item in version.plan["keyframes"]:
+            existing = {
+                keyframe.frame: keyframe
+                for keyframe in session.scalars(
+                    select(VideoKeyframe).where(
+                        VideoKeyframe.project_id == project_id,
+                        VideoKeyframe.storyboard_version_id == version_id,
+                    )
+                ).all()
+            }
+            for item in keyframe_plan:
                 frame = int(item["frame"])
                 prompt = str(item["prompt"])
                 path = output_dir / f"keyframe_{frame:06d}.png"
-                path.write_bytes(generator(prompt))
-                keyframe = VideoKeyframe(
-                    id=str(uuid4()),
-                    project_id=project_id,
-                    storyboard_version_id=version_id,
-                    frame=frame,
-                    prompt=prompt,
-                    description=str(item.get("description", "")),
-                    path=path.as_posix(),
-                    status="completed",
-                    created_at=now,
-                    updated_at=now,
+                keyframe = existing.get(frame)
+                if keyframe is None:
+                    client_task_id = f"image-video-{project_id}-keyframe-{frame}"
+                    session.add(
+                        VideoKeyframe(
+                            id=str(uuid4()),
+                            project_id=project_id,
+                            storyboard_version_id=version_id,
+                            frame=frame,
+                            prompt=prompt,
+                            description=str(item["description"]),
+                            path=path.as_posix(),
+                            status="pending",
+                            upstream_task_id=None,
+                            client_task_id=client_task_id,
+                            result_url=None,
+                            created_at=now,
+                            updated_at=now,
+                        )
+                    )
+                else:
+                    if not keyframe.client_task_id:
+                        keyframe.client_task_id = (
+                            f"image-video-{project_id}-keyframe-{frame}"
+                        )
+                    keyframe.prompt = prompt
+                    keyframe.description = str(item["description"])
+                    keyframe.path = path.as_posix()
+                    if keyframe.status != "completed" or not path.is_file():
+                        keyframe.status = "pending"
+                    keyframe.updated_at = now
+            session.commit()
+
+        generated: list[dict[str, object]] = []
+        upstream_request_marked = False
+
+        def mark_upstream_request_sent() -> None:
+            nonlocal upstream_request_marked
+            if upstream_request_marked or on_upstream_request_sent is None:
+                return
+            on_upstream_request_sent()
+            upstream_request_marked = True
+
+        for item in keyframe_plan:
+            frame = int(item["frame"])
+            with Session(self.engine) as session:
+                keyframe = session.scalar(
+                    select(VideoKeyframe).where(
+                        VideoKeyframe.project_id == project_id,
+                        VideoKeyframe.frame == frame,
+                    )
                 )
-                session.add(keyframe)
+                if keyframe is None:
+                    raise KeyError(project_id)
+                if keyframe.status == "completed" and Path(keyframe.path).is_file():
+                    generated.append(self._keyframe_preview(keyframe))
+                    continue
+                task_id = keyframe.upstream_task_id
+                client_task_id = keyframe.client_task_id
+                result_url = keyframe.result_url
+                prompt = keyframe.prompt
+                path = Path(keyframe.path)
+
+            def persist_task_id(
+                upstream_task_id: str, target_frame: int = frame
+            ) -> None:
+                with Session(self.engine) as task_session:
+                    stored = task_session.scalar(
+                        select(VideoKeyframe).where(
+                            VideoKeyframe.project_id == project_id,
+                            VideoKeyframe.frame == target_frame,
+                        )
+                    )
+                    if stored is None:
+                        raise KeyError(project_id)
+                    stored.upstream_task_id = upstream_task_id
+                    stored.updated_at = datetime.now(UTC)
+                    task_session.commit()
+                mark_upstream_request_sent()
+
+            def persist_result_url(result_url: str, target_frame: int = frame) -> None:
+                with Session(self.engine) as result_session:
+                    stored = result_session.scalar(
+                        select(VideoKeyframe).where(
+                            VideoKeyframe.project_id == project_id,
+                            VideoKeyframe.frame == target_frame,
+                        )
+                    )
+                    if stored is None:
+                        raise KeyError(project_id)
+                    stored.result_url = result_url
+                    stored.updated_at = datetime.now(UTC)
+                    result_session.commit()
+
+            generate_method = getattr(generator, "generate", None)
+            if result_url:
+                content = download_image(result_url)
+            elif callable(generate_method):
+                if task_id is not None:
+                    mark_upstream_request_sent()
+                kwargs: dict[str, object] = {
+                    "task_id": task_id,
+                    "on_task_created": persist_task_id,
+                }
+                if _accepts_keyword(generate_method, "client_task_id"):
+                    kwargs["client_task_id"] = client_task_id
+                if _accepts_keyword(generate_method, "on_result_url"):
+                    kwargs["on_result_url"] = persist_result_url
+                content = cast(
+                    bytes,
+                    generate_method(
+                        prompt,
+                        **kwargs,
+                    ),
+                )
+            else:
+                content = generator(prompt)
+
+            if can_persist is not None and not can_persist():
+                if task_id is None:
+                    with Session(self.engine) as session:
+                        pending = session.scalars(
+                            select(VideoKeyframe).where(
+                                VideoKeyframe.project_id == project_id,
+                                VideoKeyframe.status == "pending",
+                                VideoKeyframe.upstream_task_id.is_(None),
+                            )
+                        ).all()
+                        for item in pending:
+                            session.delete(item)
+                        if pending:
+                            session.commit()
+                return []
+
+            save_image_atomic(
+                content, path, validate_image=self.validate_image_saves
+            )
+            with Session(self.engine) as session:
+                keyframe = session.scalar(
+                    select(VideoKeyframe).where(
+                        VideoKeyframe.project_id == project_id,
+                        VideoKeyframe.frame == frame,
+                    )
+                )
+                if keyframe is None:
+                    raise KeyError(project_id)
+                keyframe.status = "completed"
+                keyframe.updated_at = now
+                result = self._keyframe_preview(keyframe)
+                session.commit()
                 generated.append(
-                    {
-                        "keyframe_id": keyframe.id,
-                        "frame": frame,
-                        "path": keyframe.path,
-                        "status": keyframe.status,
-                    }
+                    result
                 )
+
+        with Session(self.engine) as session:
+            project = session.get(VideoProject, project_id)
+            if project is None:
+                raise KeyError(project_id)
             project.status = "awaiting_keyframe_approval"
             project.updated_at = now
             session.commit()
-            return generated
+        return generated
 
     def regenerate_keyframe(
-        self, project_id: str, *, frame: int, generator: KeyframeGenerator
+        self,
+        project_id: str,
+        *,
+        frame: int,
+        generator: KeyframeGenerator | Any,
+        can_persist: Callable[[], bool] | None = None,
+        on_upstream_request_sent: Callable[[], None] | None = None,
     ) -> dict[str, object]:
         now = datetime.now(UTC)
         with Session(self.engine) as session:
@@ -472,31 +1018,153 @@ class VideoProjectService:
             version = session.get(VideoStoryboardVersion, keyframe.storyboard_version_id)
             if version is None:
                 raise KeyError(project_id)
-            Path(keyframe.path).write_bytes(generator(keyframe.prompt))
+            prompt = keyframe.prompt
+            path = Path(keyframe.path)
+            task_id = keyframe.upstream_task_id
+            client_task_id = keyframe.client_task_id or (
+                f"image-video-{project_id}-keyframe-{frame}"
+            )
+            result_url = keyframe.result_url
+            if keyframe.client_task_id != client_task_id:
+                keyframe.client_task_id = client_task_id
+                keyframe.updated_at = now
+                session.commit()
+            version_plan = version.plan
+
+        def persist_task_id(upstream_task_id: str) -> None:
+            with Session(self.engine) as task_session:
+                stored = task_session.scalar(
+                    select(VideoKeyframe).where(
+                        VideoKeyframe.project_id == project_id,
+                        VideoKeyframe.frame == frame,
+                    )
+                )
+                if stored is None:
+                    raise KeyError(project_id)
+                stored.upstream_task_id = upstream_task_id
+                stored.updated_at = datetime.now(UTC)
+                task_session.commit()
+            if on_upstream_request_sent is not None:
+                on_upstream_request_sent()
+
+        def persist_result_url(result_url: str) -> None:
+            with Session(self.engine) as result_session:
+                stored = result_session.scalar(
+                    select(VideoKeyframe).where(
+                        VideoKeyframe.project_id == project_id,
+                        VideoKeyframe.frame == frame,
+                    )
+                )
+                if stored is None:
+                    raise KeyError(project_id)
+                stored.result_url = result_url
+                stored.updated_at = datetime.now(UTC)
+                result_session.commit()
+
+        generate_method = getattr(generator, "generate", None)
+        if result_url:
+            content = download_image(result_url)
+        elif callable(generate_method):
+            if task_id is not None and on_upstream_request_sent is not None:
+                on_upstream_request_sent()
+            kwargs: dict[str, object] = {
+                "task_id": task_id,
+                "on_task_created": persist_task_id,
+            }
+            if _accepts_keyword(generate_method, "client_task_id"):
+                kwargs["client_task_id"] = client_task_id
+            if _accepts_keyword(generate_method, "on_result_url"):
+                kwargs["on_result_url"] = persist_result_url
+            content = cast(
+                bytes,
+                generate_method(
+                    prompt,
+                    **kwargs,
+                ),
+            )
+        else:
+            content = generator(prompt)
+        if can_persist is not None and not can_persist():
+            return {"frame": frame, "status": "cancelled"}
+        save_image_atomic(content, path, validate_image=self.validate_image_saves)
+
+        with Session(self.engine) as session:
+            keyframe = session.scalar(
+                select(VideoKeyframe).where(
+                    VideoKeyframe.project_id == project_id,
+                    VideoKeyframe.frame == frame,
+                )
+            )
+            if keyframe is None:
+                raise KeyError(project_id)
             keyframe.updated_at = now
+            keyframe.status = "completed"
             project = session.get(VideoProject, project_id)
-            invalidated_segments = self._adjacent_segments(version.plan, frame)
+            invalidated_segments = self._adjacent_segments(version_plan, frame)
+            invalidated_pairs = {
+                (segment["start_frame"], segment["end_frame"])
+                for segment in invalidated_segments
+            }
+            affected_frames = session.scalars(
+                select(VideoFrame).where(VideoFrame.project_id == project_id)
+            ).all()
+            for video_frame in affected_frames:
+                if (
+                    video_frame.segment_start_frame,
+                    video_frame.segment_end_frame,
+                ) in invalidated_pairs:
+                    video_frame.status = "invalid"
+                    video_frame.error_message = "相邻关键帧已变更"
+                    video_frame.updated_at = now
             if project is not None:
-                project.settings = {
+                settings = {
                     **project.settings,
                     "invalidated_segments": invalidated_segments,
                 }
+                settings.pop("output_video_path", None)
+                project.settings = settings
+                project.status = "awaiting_keyframe_approval"
                 project.updated_at = now
             result = self._keyframe_preview(keyframe)
             result["invalidated_segments"] = invalidated_segments
             session.commit()
             return result
 
+    def request_keyframe_regeneration(
+        self, project_id: str, *, frame: int, enqueue: Callable[[], str]
+    ) -> str:
+        with Session(self.engine) as session:
+            keyframe = session.scalar(
+                select(VideoKeyframe).where(
+                    VideoKeyframe.project_id == project_id,
+                    VideoKeyframe.frame == frame,
+                )
+            )
+            if keyframe is None:
+                raise KeyError(project_id)
+            if keyframe.status == "completed":
+                keyframe.upstream_task_id = None
+                keyframe.result_url = None
+                keyframe.status = "pending"
+            keyframe.updated_at = datetime.now(UTC)
+            session.commit()
+        return enqueue()
+
     def list_keyframes(self, project_id: str) -> list[dict[str, object]]:
         with Session(self.engine) as session:
-            if session.get(VideoProject, project_id) is None:
+            project = session.get(VideoProject, project_id)
+            if project is None:
                 raise KeyError(project_id)
+            fps = int(project.settings.get("fps", 24) or 24)
             keyframes = session.scalars(
                 select(VideoKeyframe)
                 .where(VideoKeyframe.project_id == project_id)
                 .order_by(VideoKeyframe.frame)
             ).all()
-            return [self._keyframe_preview(keyframe) for keyframe in keyframes]
+            return [
+                self._keyframe_preview(keyframe, fps=fps, project_id=project_id)
+                for keyframe in keyframes
+            ]
 
     def confirm_keyframes(self, project_id: str) -> None:
         with Session(self.engine) as session:
@@ -509,16 +1177,39 @@ class VideoProjectService:
             project.updated_at = datetime.now(UTC)
             session.commit()
 
+    def request_frame_generation(self, project_id: str, enqueue: Callable[[], str]) -> str:
+        with Session(self.engine) as session:
+            project = session.get(VideoProject, project_id)
+            if project is None:
+                raise KeyError(project_id)
+            if project.status not in {"generating_frames", "needs_attention"}:
+                raise ValueError("只有连续帧生成状态可生成中间帧")
+            if project.status == "needs_attention":
+                project.status = "generating_frames"
+            project.updated_at = datetime.now(UTC)
+            session.commit()
+        return enqueue()
+
     def generate_intermediate_frames(
-        self, project_id: str, *, generator: FrameGenerator
+        self,
+        project_id: str,
+        *,
+        generator: FrameGenerator,
+        can_persist: Callable[[], bool] | None = None,
+        on_upstream_request_sent: Callable[[], None] | None = None,
+        downloader: ImageDownloader = download_image,
     ) -> list[dict[str, object]]:
         now = datetime.now(UTC)
         with Session(self.engine) as session:
             project = session.get(VideoProject, project_id)
             if project is None:
                 raise KeyError(project_id)
-            if project.status != "generating_frames":
+            if project.status not in {"generating_frames", "needs_attention"}:
                 raise ValueError("只有连续帧生成状态可生成中间帧")
+            if project.status == "needs_attention":
+                project.status = "generating_frames"
+                project.updated_at = now
+                session.commit()
             version_id = project.settings.get("approved_storyboard_version_id")
             if not isinstance(version_id, str):
                 raise ValueError("缺少已确认分镜版本")
@@ -545,30 +1236,90 @@ class VideoProjectService:
                     select(VideoFrame).where(VideoFrame.project_id == project_id)
                 ).all()
             }
+            for frame, video_frame in existing_frames.items():
+                if not video_frame.client_task_id:
+                    video_frame.client_task_id = (
+                        f"image-video-{project_id}-frame-{frame}"
+                    )
+                    video_frame.updated_at = now
             output_dir = self.data_root / "video_projects" / project_id / "frames"
             output_dir.mkdir(parents=True, exist_ok=True)
             generated: list[dict[str, object]] = []
             segments = self._storyboard_segments(version.plan)
-            previous_paths = {
-                index: keyframes.get(segment["start_frame"])
-                for index, segment in enumerate(segments)
-            }
-            max_span = max(
-                (segment["end_frame"] - segment["start_frame"] for segment in segments),
-                default=0,
-            )
-            for offset in range(1, max_span):
-                for index, segment in enumerate(segments):
-                    frame = segment["start_frame"] + offset
-                    if frame >= segment["end_frame"]:
+            for segment in segments:
+                for frame in range(
+                    segment["start_frame"] + 1, segment["end_frame"]
+                ):
+                    if frame in existing_frames:
                         continue
-                    existing = existing_frames.get(frame)
+                    video_frame = VideoFrame(
+                        id=str(uuid4()),
+                        project_id=project_id,
+                        frame=frame,
+                        segment_start_frame=segment["start_frame"],
+                        segment_end_frame=segment["end_frame"],
+                        prompt=segment["prompt"],
+                        path=(
+                            output_dir / f"frame_{frame:06d}.png"
+                        ).as_posix(),
+                        status="pending",
+                        error_message="",
+                        upstream_task_id=None,
+                        client_task_id=f"image-video-{project_id}-frame-{frame}",
+                        result_url=None,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                    session.add(video_frame)
+                    existing_frames[frame] = video_frame
+            session.commit()
+            frame_states = {
+                frame: {
+                    "status": video_frame.status,
+                    "path": video_frame.path,
+                    "upstream_task_id": video_frame.upstream_task_id,
+                    "client_task_id": video_frame.client_task_id,
+                    "result_url": video_frame.result_url,
+                }
+                for frame, video_frame in existing_frames.items()
+            }
+            completed_results: list[dict[str, object]] = []
+            generated_contents: list[tuple[dict[str, Any], int, Path, bytes]] = []
+            mark_lock = Lock()
+            upstream_request_marked = False
+
+            def mark_upstream_request_sent() -> None:
+                nonlocal upstream_request_marked
+                if upstream_request_marked or on_upstream_request_sent is None:
+                    return
+                with mark_lock:
+                    if upstream_request_marked:
+                        return
+                    on_upstream_request_sent()
+                    upstream_request_marked = True
+
+            class FrameGenerationTimeout(TimeoutError):
+                def __init__(self, segment: dict[str, Any], frame: int, path: Path):
+                    super().__init__("上游请求超时，结果状态不确定")
+                    self.segment = segment
+                    self.frame = frame
+                    self.path = path
+
+            def generate_segment(
+                index: int, segment: dict[str, Any]
+            ) -> list[tuple[dict[str, Any], int, Path, bytes]]:
+                del index
+                segment_results: list[tuple[dict[str, Any], int, Path, bytes]] = []
+                previous_path = keyframes.get(segment["start_frame"])
+                for offset in range(1, segment["end_frame"] - segment["start_frame"]):
+                    frame = segment["start_frame"] + offset
+                    existing = frame_states.get(frame)
                     if (
                         existing is not None
-                        and existing.status == "completed"
-                        and Path(existing.path).is_file()
+                        and existing["status"] == "completed"
+                        and Path(str(existing["path"])).is_file()
                     ):
-                        previous_paths[index] = existing.path
+                        previous_path = str(existing["path"])
                         continue
                     anchor_frame_paths = [
                         path
@@ -579,75 +1330,196 @@ class VideoProjectService:
                         if path is not None
                     ]
                     path = output_dir / f"frame_{frame:06d}.png"
+
+                    def persist_task_id(
+                        upstream_task_id: str, target_frame: int = frame
+                    ) -> None:
+                        with Session(self.engine) as task_session:
+                            stored = task_session.scalar(
+                                select(VideoFrame).where(
+                                    VideoFrame.project_id == project_id,
+                                    VideoFrame.frame == target_frame,
+                                )
+                            )
+                            if stored is None:
+                                raise KeyError(project_id)
+                            stored.upstream_task_id = upstream_task_id
+                            stored.updated_at = datetime.now(UTC)
+                            task_session.commit()
+                        mark_upstream_request_sent()
+
+                    def persist_result_url(
+                        result_url: str, target_frame: int = frame
+                    ) -> None:
+                        with Session(self.engine) as result_session:
+                            stored = result_session.scalar(
+                                select(VideoFrame).where(
+                                    VideoFrame.project_id == project_id,
+                                    VideoFrame.frame == target_frame,
+                                )
+                            )
+                            if stored is None:
+                                raise KeyError(project_id)
+                            stored.result_url = result_url
+                            stored.updated_at = datetime.now(UTC)
+                            result_session.commit()
+
                     try:
-                        content = generator(
-                            frame=frame,
-                            prompt=segment["prompt"],
-                            references=(
-                                user_references[:7]
-                                if previous_paths[index]
-                                == keyframes.get(segment["start_frame"])
-                                else user_references[:6]
-                            ),
-                            previous_frame_path=previous_paths[index],
-                            anchor_frame_paths=anchor_frame_paths,
+                        selected_references = (
+                            user_references[:7]
+                            if previous_path == keyframes.get(segment["start_frame"])
+                            else user_references[:6]
                         )
-                    except TimeoutError:
-                        video_frame = existing or VideoFrame(
-                            id=str(uuid4()),
-                            project_id=project_id,
-                            frame=frame,
-                            created_at=now,
-                        )
-                        video_frame.segment_start_frame = segment["start_frame"]
-                        video_frame.segment_end_frame = segment["end_frame"]
-                        video_frame.prompt = segment["prompt"]
-                        video_frame.path = path.as_posix()
-                        video_frame.status = "needs_attention"
-                        video_frame.error_message = "上游请求超时，结果状态不确定"
-                        video_frame.updated_at = now
-                        if existing is None:
-                            session.add(video_frame)
-                            existing_frames[frame] = video_frame
-                        project.status = "needs_attention"
-                        project.updated_at = now
-                        session.commit()
-                        raise
-                    path.write_bytes(content)
-                    video_frame = existing or VideoFrame(
-                        id=str(uuid4()),
-                        project_id=project_id,
-                        frame=frame,
-                        created_at=now,
+                        generate_method = getattr(generator, "generate", None)
+                        if existing is not None and existing.get("result_url"):
+                            content = downloader(str(existing["result_url"]))
+                        elif callable(generate_method):
+                            if (
+                                existing is not None
+                                and existing["upstream_task_id"] is not None
+                            ):
+                                mark_upstream_request_sent()
+                            kwargs: dict[str, object] = {
+                                "frame": frame,
+                                "prompt": str(segment["prompt"]),
+                                "references": selected_references,
+                                "previous_frame_path": previous_path,
+                                "anchor_frame_paths": anchor_frame_paths,
+                                "task_id": (
+                                    existing["upstream_task_id"]
+                                    if existing is not None
+                                    else None
+                                ),
+                                "on_task_created": persist_task_id,
+                            }
+                            if _accepts_keyword(generate_method, "client_task_id"):
+                                kwargs["client_task_id"] = (
+                                    existing["client_task_id"]
+                                    if existing is not None
+                                    else f"image-video-{project_id}-frame-{frame}"
+                                )
+                            if _accepts_keyword(generate_method, "on_result_url"):
+                                kwargs["on_result_url"] = persist_result_url
+                            content = cast(
+                                bytes,
+                                generate_method(**kwargs),
+                            )
+                        else:
+                            content = generator(
+                                frame=frame,
+                                prompt=str(segment["prompt"]),
+                                references=selected_references,
+                                previous_frame_path=previous_path,
+                                anchor_frame_paths=anchor_frame_paths,
+                            )
+                    except TimeoutError as exc:
+                        raise FrameGenerationTimeout(segment, frame, path) from exc
+                    if can_persist is not None and not can_persist():
+                        return segment_results
+                    save_image_atomic(
+                        content, path, validate_image=self.validate_image_saves
                     )
-                    video_frame.segment_start_frame = segment["start_frame"]
-                    video_frame.segment_end_frame = segment["end_frame"]
-                    video_frame.prompt = segment["prompt"]
-                    video_frame.path = path.as_posix()
-                    video_frame.status = "completed"
-                    video_frame.error_message = ""
-                    video_frame.updated_at = now
-                    if existing is None:
-                        session.add(video_frame)
-                        existing_frames[frame] = video_frame
-                    previous_paths[index] = video_frame.path
-                    generated.append(
-                        {
-                            "frame_id": video_frame.id,
-                            "frame": frame,
-                            "path": video_frame.path,
-                            "status": video_frame.status,
-                        }
+                    segment_results.append((segment, frame, path, content))
+                    previous_path = path.as_posix()
+                return segment_results
+
+            try:
+                with ThreadPoolExecutor(max_workers=max(1, len(segments))) as executor:
+                    futures = [
+                        executor.submit(generate_segment, index, segment)
+                        for index, segment in enumerate(segments)
+                    ]
+                    for future in as_completed(futures):
+                        generated_contents.extend(future.result())
+            except FrameGenerationTimeout as exc:
+                video_frame = session.scalar(
+                    select(VideoFrame).where(
+                        VideoFrame.project_id == project_id,
+                        VideoFrame.frame == exc.frame,
                     )
+                )
+                if video_frame is None:
+                    raise KeyError(project_id) from exc
+                video_frame.segment_start_frame = exc.segment["start_frame"]
+                video_frame.segment_end_frame = exc.segment["end_frame"]
+                video_frame.prompt = exc.segment["prompt"]
+                video_frame.path = exc.path.as_posix()
+                video_frame.status = "needs_attention"
+                video_frame.error_message = "上游请求超时，结果状态不确定"
+                video_frame.updated_at = now
+                project.status = "needs_attention"
+                project.updated_at = now
+                session.commit()
+                raise
+
+            if can_persist is not None and not can_persist():
+                for _, _, path, _ in generated_contents:
+                    path.unlink(missing_ok=True)
+                pending = session.scalars(
+                    select(VideoFrame).where(
+                        VideoFrame.project_id == project_id,
+                        VideoFrame.status == "pending",
+                        VideoFrame.upstream_task_id.is_(None),
+                    )
+                ).all()
+                for item in pending:
+                    session.delete(item)
+                if pending:
+                    session.commit()
+                return []
+
+            for segment, frame, path, _content in sorted(
+                generated_contents, key=lambda item: item[1]
+            ):
+                video_frame = session.scalar(
+                    select(VideoFrame).where(
+                        VideoFrame.project_id == project_id,
+                        VideoFrame.frame == frame,
+                    )
+                )
+                if video_frame is None:
+                    raise KeyError(project_id)
+                video_frame.segment_start_frame = segment["start_frame"]
+                video_frame.segment_end_frame = segment["end_frame"]
+                video_frame.prompt = segment["prompt"]
+                video_frame.path = path.as_posix()
+                video_frame.status = "completed"
+                video_frame.error_message = ""
+                video_frame.updated_at = now
+                completed_results.append(
+                    {
+                        "frame_id": video_frame.id,
+                        "frame": frame,
+                        "path": video_frame.path,
+                        "status": video_frame.status,
+                    }
+                )
+            generated.extend(completed_results)
             project.updated_at = now
             session.commit()
             return generated
 
     def repair_frame(
-        self, project_id: str, *, frame: int, generator: FrameGenerator
+        self,
+        project_id: str,
+        *,
+        frame: int,
+        generator: FrameGenerator,
+        can_persist: Callable[[], bool] | None = None,
+        on_upstream_request_sent: Callable[[], None] | None = None,
+        downloader: ImageDownloader = download_image,
     ) -> dict[str, object]:
         now = datetime.now(UTC)
         with Session(self.engine) as session:
+            project = session.get(VideoProject, project_id)
+            if project is None:
+                raise KeyError(project_id)
+            version_id = project.settings.get("approved_storyboard_version_id")
+            if not isinstance(version_id, str):
+                raise ValueError("缺少已确认分镜版本")
+            version = session.get(VideoStoryboardVersion, version_id)
+            if version is None or version.project_id != project_id:
+                raise KeyError(project_id)
             video_frame = session.scalar(
                 select(VideoFrame).where(
                     VideoFrame.project_id == project_id,
@@ -655,7 +1527,53 @@ class VideoProjectService:
                 )
             )
             if video_frame is None:
-                raise KeyError(project_id)
+                segment = self._segment_for_frame(version.plan, frame)
+                if segment is None:
+                    raise KeyError(project_id)
+                frame_id = str(uuid4())
+                segment_start_frame = segment["start_frame"]
+                segment_end_frame = segment["end_frame"]
+                prompt = segment["prompt"]
+                path = (
+                    self.data_root
+                    / "video_projects"
+                    / project_id
+                    / "frames"
+                    / f"frame_{frame:06d}.png"
+                )
+                video_frame = VideoFrame(
+                    id=frame_id,
+                    project_id=project_id,
+                    frame=frame,
+                    segment_start_frame=segment_start_frame,
+                    segment_end_frame=segment_end_frame,
+                    prompt=prompt,
+                    path=path.as_posix(),
+                    status="pending",
+                    error_message="",
+                    upstream_task_id=None,
+                    client_task_id=f"image-video-{project_id}-repair-{frame}",
+                    result_url=None,
+                    created_at=now,
+                    updated_at=now,
+                )
+                session.add(video_frame)
+                session.commit()
+            else:
+                frame_id = video_frame.id
+                segment_start_frame = video_frame.segment_start_frame
+                segment_end_frame = video_frame.segment_end_frame
+                prompt = video_frame.prompt
+                path = Path(video_frame.path)
+                if not video_frame.client_task_id:
+                    video_frame.client_task_id = (
+                        f"image-video-{project_id}-repair-{frame}"
+                    )
+                    video_frame.updated_at = now
+                    session.commit()
+            task_id = video_frame.upstream_task_id
+            client_task_id = video_frame.client_task_id
+            result_url = video_frame.result_url
             previous_frame = session.scalar(
                 select(VideoFrame)
                 .where(
@@ -682,28 +1600,119 @@ class VideoProjectService:
             anchor_frame_paths = [
                 path
                 for path in [
-                    keyframes.get(video_frame.segment_start_frame),
-                    keyframes.get(video_frame.segment_end_frame),
+                    keyframes.get(segment_start_frame),
+                    keyframes.get(segment_end_frame),
                 ]
                 if path is not None
             ]
-            try:
-                Path(video_frame.path).write_bytes(
-                    generator(
-                        frame=frame,
-                        prompt=video_frame.prompt,
-                        references=references,
-                        previous_frame_path=(
-                            previous_frame.path if previous_frame is not None else None
-                        ),
-                        anchor_frame_paths=anchor_frame_paths,
+            previous_frame_path = (
+                previous_frame.path if previous_frame is not None else None
+            )
+
+        def persist_task_id(upstream_task_id: str) -> None:
+            with Session(self.engine) as task_session:
+                stored = task_session.scalar(
+                    select(VideoFrame).where(
+                        VideoFrame.project_id == project_id,
+                        VideoFrame.frame == frame,
                     )
+                )
+                if stored is None:
+                    raise KeyError(project_id)
+                stored.upstream_task_id = upstream_task_id
+                stored.updated_at = datetime.now(UTC)
+                task_session.commit()
+            if on_upstream_request_sent is not None:
+                on_upstream_request_sent()
+
+        def persist_result_url(result_url: str) -> None:
+            with Session(self.engine) as result_session:
+                stored = result_session.scalar(
+                    select(VideoFrame).where(
+                        VideoFrame.project_id == project_id,
+                        VideoFrame.frame == frame,
+                    )
+                )
+                if stored is None:
+                    raise KeyError(project_id)
+                stored.result_url = result_url
+                stored.updated_at = datetime.now(UTC)
+                result_session.commit()
+
+        try:
+            generate_method = getattr(generator, "generate", None)
+            if result_url:
+                content = downloader(result_url)
+            elif callable(generate_method):
+                if task_id is not None and on_upstream_request_sent is not None:
+                    on_upstream_request_sent()
+                kwargs: dict[str, object] = {
+                    "frame": frame,
+                    "prompt": prompt,
+                    "references": references,
+                    "previous_frame_path": previous_frame_path,
+                    "anchor_frame_paths": anchor_frame_paths,
+                    "task_id": task_id,
+                    "on_task_created": persist_task_id,
+                }
+                if _accepts_keyword(generate_method, "client_task_id"):
+                    kwargs["client_task_id"] = client_task_id
+                if _accepts_keyword(generate_method, "on_result_url"):
+                    kwargs["on_result_url"] = persist_result_url
+                content = cast(
+                    bytes,
+                    generate_method(**kwargs),
+                )
+            else:
+                content = generator(
+                    frame=frame,
+                    prompt=prompt,
+                    references=references,
+                    previous_frame_path=previous_frame_path,
+                    anchor_frame_paths=anchor_frame_paths,
+                )
+            status = "completed"
+            error_message = ""
+        except TimeoutError as exc:
+            content = None
+            status = "needs_attention"
+            error_message = str(exc)
+
+        if can_persist is not None and not can_persist():
+            return {"frame_id": frame_id, "frame": frame, "status": "cancelled"}
+
+        with Session(self.engine) as session:
+            video_frame = session.scalar(
+                select(VideoFrame).where(
+                    VideoFrame.project_id == project_id,
+                    VideoFrame.frame == frame,
+                )
+            )
+            if video_frame is None:
+                video_frame = VideoFrame(
+                    id=frame_id,
+                    project_id=project_id,
+                    frame=frame,
+                    segment_start_frame=segment_start_frame,
+                    segment_end_frame=segment_end_frame,
+                    prompt=prompt,
+                    path=path.as_posix(),
+                    status=status,
+                    error_message=error_message,
+                    created_at=now,
+                    updated_at=now,
+                )
+                session.add(video_frame)
+            if content is not None:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                save_image_atomic(
+                    content, path, validate_image=self.validate_image_saves
                 )
                 video_frame.status = "completed"
                 video_frame.error_message = ""
-            except TimeoutError as exc:
+            else:
                 video_frame.status = "needs_attention"
-                video_frame.error_message = str(exc)
+                video_frame.error_message = error_message
             video_frame.updated_at = now
             session.commit()
             return {
@@ -713,8 +1722,88 @@ class VideoProjectService:
                 "status": video_frame.status,
             }
 
+    def list_frame_issues(self, project_id: str) -> list[dict[str, object]]:
+        with Session(self.engine) as session:
+            project = session.get(VideoProject, project_id)
+            if project is None:
+                raise KeyError(project_id)
+            version_id = project.settings.get("approved_storyboard_version_id")
+            if not isinstance(version_id, str):
+                raise ValueError("缺少已确认分镜版本")
+            version = session.get(VideoStoryboardVersion, version_id)
+            if version is None or version.project_id != project_id:
+                raise KeyError(project_id)
+            frames_by_number = {
+                video_frame.frame: video_frame
+                for video_frame in session.scalars(
+                    select(VideoFrame).where(VideoFrame.project_id == project_id)
+                ).all()
+            }
+            fps = int(project.settings.get("fps", 24) or 24)
+            issues: list[dict[str, object]] = []
+            for segment in self._storyboard_segments(version.plan):
+                for frame in range(segment["start_frame"] + 1, segment["end_frame"]):
+                    video_frame = frames_by_number.get(frame)
+                    status = ""
+                    error_message = ""
+                    prompt = str(segment["prompt"])
+                    if video_frame is None:
+                        status = "missing_record"
+                    elif video_frame.status != "completed":
+                        status = video_frame.status
+                        error_message = video_frame.error_message
+                        prompt = video_frame.prompt
+                    elif not Path(video_frame.path).is_file():
+                        status = "missing_file"
+                        prompt = video_frame.prompt
+                    if status:
+                        issues.append(
+                            {
+                                "frame": frame,
+                                "time_seconds": frame / fps,
+                                "status": status,
+                                "segment_start_frame": segment["start_frame"],
+                                "segment_end_frame": segment["end_frame"],
+                                "prompt": prompt,
+                                "error_message": error_message,
+                            }
+                        )
+            return issues
+
+    def request_frame_repair(
+        self, project_id: str, *, frame: int, enqueue: Callable[[], str]
+    ) -> str:
+        with Session(self.engine) as session:
+            video_frame = session.scalar(
+                select(VideoFrame).where(
+                    VideoFrame.project_id == project_id,
+                    VideoFrame.frame == frame,
+                )
+            )
+            if video_frame is None:
+                project = session.get(VideoProject, project_id)
+                if project is None:
+                    raise KeyError(project_id)
+                version_id = project.settings.get("approved_storyboard_version_id")
+                if not isinstance(version_id, str):
+                    raise ValueError("缺少已确认分镜版本")
+                version = session.get(VideoStoryboardVersion, version_id)
+                if version is None or version.project_id != project_id:
+                    raise KeyError(project_id)
+                if self._segment_for_frame(version.plan, frame) is None:
+                    raise KeyError(project_id)
+            else:
+                video_frame.updated_at = datetime.now(UTC)
+            session.commit()
+        return enqueue()
+
     def stitch_video(
-        self, project_id: str, *, ffmpeg_path: str, runner: FfmpegRunner
+        self,
+        project_id: str,
+        *,
+        ffmpeg_path: str,
+        runner: FfmpegRunner,
+        can_persist: Callable[[], bool] | None = None,
     ) -> dict[str, object]:
         now = datetime.now(UTC)
         with Session(self.engine) as session:
@@ -774,24 +1863,36 @@ class VideoProjectService:
                 encoding="utf-8",
             )
             output_path = output_dir / "video.mp4"
-            runner(
-                [
-                    ffmpeg_path,
-                    "-y",
-                    "-f",
-                    "concat",
-                    "-safe",
-                    "0",
-                    "-i",
-                    concat_path.as_posix(),
-                    "-an",
-                    "-c:v",
-                    "libx264",
-                    "-pix_fmt",
-                    "yuv420p",
-                    output_path.as_posix(),
-                ]
-            )
+            temp_output_path = output_dir / "video.tmp.mp4"
+            session.commit()
+        runner(
+            [
+                ffmpeg_path,
+                "-y",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                concat_path.as_posix(),
+                "-an",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                temp_output_path.as_posix(),
+            ]
+        )
+        if can_persist is not None and not can_persist():
+            if temp_output_path.exists():
+                temp_output_path.unlink()
+            return {"project_id": project_id, "status": "cancelled"}
+        if temp_output_path.exists():
+            temp_output_path.replace(output_path)
+        with Session(self.engine) as session:
+            project = session.get(VideoProject, project_id)
+            if project is None:
+                raise KeyError(project_id)
             project.status = "completed"
             project.settings = {
                 **project.settings,
@@ -805,12 +1906,33 @@ class VideoProjectService:
                 "path": output_path.as_posix(),
             }
 
+    def request_stitch_video(self, project_id: str, enqueue: Callable[[], str]) -> str:
+        with Session(self.engine) as session:
+            project = session.get(VideoProject, project_id)
+            if project is None:
+                raise KeyError(project_id)
+            if project.status not in {"generating_frames", "needs_attention"}:
+                raise ValueError("当前状态不能合成视频")
+            project.updated_at = datetime.now(UTC)
+            session.commit()
+        return enqueue()
+
     @staticmethod
-    def _keyframe_preview(keyframe: VideoKeyframe) -> dict[str, object]:
+    def _keyframe_preview(
+        keyframe: VideoKeyframe, *, fps: int = 24, project_id: str | None = None
+    ) -> dict[str, object]:
+        safe_fps = max(1, fps)
+        resolved_project_id = project_id or keyframe.project_id
         return {
             "keyframe_id": keyframe.id,
             "frame": keyframe.frame,
+            "time_seconds": keyframe.frame / safe_fps,
+            "description": keyframe.description,
+            "prompt": keyframe.prompt,
             "path": keyframe.path,
+            "media_url": (
+                f"/api/v1/video-projects/{resolved_project_id}/keyframes/{keyframe.frame}/media"
+            ),
             "status": keyframe.status,
         }
 
@@ -850,6 +1972,15 @@ class VideoProjectService:
             )
         return normalized
 
+    @classmethod
+    def _segment_for_frame(
+        cls, plan: Mapping[str, object], frame: int
+    ) -> dict[str, Any] | None:
+        for segment in cls._storyboard_segments(plan):
+            if segment["start_frame"] < frame < segment["end_frame"]:
+                return segment
+        return None
+
     @staticmethod
     def _validate_storyboard(plan: StoryboardPlan) -> None:
         frames = [keyframe.frame for keyframe in plan.keyframes]
@@ -857,18 +1988,34 @@ class VideoProjectService:
             raise ValueError("首个关键帧必须从 0 开始")
         if frames != sorted(set(frames)):
             raise ValueError("关键帧必须按帧号递增且不能重复")
+        frame_set = set(frames)
         for segment in plan.segments:
             if segment.end_frame <= segment.start_frame:
                 raise ValueError("片段结束帧必须大于开始帧")
+            if segment.start_frame not in frame_set or segment.end_frame not in frame_set:
+                raise ValueError("片段边界必须对应关键帧")
+        segment_pairs = [
+            (segment.start_frame, segment.end_frame)
+            for segment in sorted(plan.segments, key=lambda item: item.start_frame)
+        ]
+        expected_pairs = list(zip(frames, frames[1:], strict=False))
+        if segment_pairs and segment_pairs != expected_pairs:
+            raise ValueError("片段必须按关键帧连续衔接")
 
     @staticmethod
-    def _reference_labels(session: Session, project_id: str) -> list[dict[str, str]]:
+    def _reference_labels(
+        session: Session, project_id: str
+    ) -> list[dict[str, str | int]]:
         references = session.scalars(
             select(VideoReferenceImage)
             .where(VideoReferenceImage.project_id == project_id)
             .order_by(VideoReferenceImage.position)
         ).all()
         return [
-            {"label": reference.label, "note": reference.note}
+            {
+                "label": reference.label,
+                "note": reference.note,
+                "position": reference.position,
+            }
             for reference in references
         ]

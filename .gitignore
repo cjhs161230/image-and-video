@@ -16,6 +16,7 @@ htmlcov/
 coverage.xml
 
 node_modules/
+.npm-cache/
 npm-debug.log*
 
 data/*

@@ -1,10 +1,10 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="theme-dark">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>图像与视频工作台</title>
-    <link rel="stylesheet" href="/assets/styles.css" />
+    <link rel="stylesheet" href="/assets/styles.css?v=20260624-ui-pages" />
   </head>
   <body>
     <main id="app">
@@ -15,10 +15,10 @@
       </header>
 
       <nav aria-label="主导航">
-        <a href="#image-workbench">图片工作台</a>
-        <a href="#video-projects">视频项目</a>
-        <a href="#history">历史</a>
-        <a href="#settings">设置</a>
+        <a href="#image-workbench" data-nav-link="image-workbench">图片工作台</a>
+        <a href="#video-projects" data-nav-link="video-projects">视频项目</a>
+        <a href="#history" data-nav-link="history">历史</a>
+        <a href="#settings" data-nav-link="settings">设置</a>
       </nav>
 
       <section id="image-workbench" data-page="图片工作台">
@@ -52,15 +52,83 @@
               </select>
             </label>
             <label>
+              尺寸
+              <input name="size" value="1024x1024" placeholder="1024x1024 或 auto" />
+            </label>
+            <label>
+              质量
+              <select name="quality">
+                <option value="auto">auto</option>
+                <option value="low">low</option>
+                <option value="medium" selected>medium</option>
+                <option value="high">high</option>
+              </select>
+            </label>
+            <label>
+              风格
+              <select name="style">
+                <option value="vivid" selected>vivid</option>
+                <option value="natural">natural</option>
+              </select>
+            </label>
+            <label>
+              背景
+              <select name="background">
+                <option value="auto" selected>auto</option>
+                <option value="transparent">transparent</option>
+                <option value="opaque">opaque</option>
+              </select>
+            </label>
+            <label>
+              审核强度
+              <select name="moderation">
+                <option value="auto" selected>auto</option>
+                <option value="low">low</option>
+              </select>
+            </label>
+            <label>
+              压缩质量
+              <input
+                name="output_compression"
+                type="number"
+                min="0"
+                max="100"
+                placeholder="仅 JPEG / WebP"
+              />
+            </label>
+            <label>
+              输入保真度
+              <select name="input_fidelity">
+                <option value="">自动</option>
+                <option value="low">low</option>
+                <option value="high">high</option>
+              </select>
+            </label>
+            <label>
               Matsca 模式
               <select name="matsca_mode">
                 <option value="direct">直连</option>
-                <option value="app">应用</option>
                 <option value="native">原生</option>
               </select>
             </label>
           </div>
-          <p>积分估算与磁盘估算将在视频阶段重新闭合。</p>
+          <label>
+            图生图输入
+            <input
+              id="image-input-files"
+              name="image_input_files"
+              type="file"
+              accept="image/png,image/jpeg,image/webp"
+              multiple
+            />
+          </label>
+          <p class="helper-text">最多上传 8 张输入图；提交时会先转成受控 media_id。</p>
+          <p id="image-upload-status"></p>
+          <p id="image-cost-estimate">积分估算：1；磁盘估算：12 MB</p>
+          <label class="inline-check">
+            <input name="confirm_cost" type="checkbox" />
+            确认成本
+          </label>
           <button type="submit">生成图片</button>
         </form>
 
@@ -78,20 +146,157 @@
 
       <section id="video-projects" data-page="视频项目">
         <h2>视频项目</h2>
-        <p>视频队列、连续帧和两次人工门禁正在重新验收，本阶段暂不开放操作。</p>
+        <form id="video-draft-form">
+          <label>
+            项目标题
+            <input name="title" required value="演示视频" />
+          </label>
+          <label>
+            视频描述
+            <textarea name="description" required placeholder="描述角色、场景和镜头"></textarea>
+          </label>
+          <div class="form-grid">
+            <label>
+              视频时长（秒）
+              <input name="duration_seconds" type="number" value="5" min="0.1" step="0.1" />
+            </label>
+            <label>
+              每秒帧数（FPS）
+              <input name="fps" type="number" value="24" min="1" max="60" />
+            </label>
+          </div>
+          <p id="video-frame-estimate">预计生成帧数：120；结束帧：119</p>
+          <div class="reference-toggle-row">
+            <button
+              type="button"
+              id="toggle-video-references"
+              aria-expanded="false"
+              aria-controls="reference-panel"
+            >
+              展开参考图
+            </button>
+            <span id="video-reference-summary">参考图：0/8</span>
+          </div>
+          <div id="reference-panel" class="reference-panel" hidden>
+            <div id="video-reference-inputs" class="reference-inputs"></div>
+            <p class="helper-text">
+              参考图上传：最多 8 张；可直接上传，也可继续手填已有 media_id。
+            </p>
+            <p id="video-upload-status"></p>
+          </div>
+          <p id="video-cost-estimate">积分估算：121；磁盘估算：1452 MB</p>
+          <label class="inline-check">
+            <input name="confirm_cost" type="checkbox" />
+            确认成本
+          </label>
+          <label class="inline-check">
+            <input name="confirm_high_cost" type="checkbox" />
+            高成本 / 高磁盘占用二次确认
+          </label>
+          <div class="controls">
+            <button type="submit">保存草稿</button>
+            <button type="button" id="generate-storyboard">生成分镜</button>
+            <button type="button" id="review-storyboard">AI 复审分镜</button>
+            <button type="button" id="confirm-storyboard">确认分镜</button>
+            <button type="button" id="generate-keyframes">生成关键帧</button>
+            <button type="button" id="confirm-keyframes">确认关键帧</button>
+            <button type="button" id="generate-frames">生成连续帧</button>
+            <button type="button" id="check-frame-issues">检查帧问题</button>
+            <button type="button" id="stitch-video">合成视频</button>
+          </div>
+        </form>
+        <div class="job-panel">
+          <div><strong>视频项目：</strong><span id="video-project-id">尚未创建</span></div>
+          <div><strong>视频任务：</strong><span id="video-job-status">尚无任务</span></div>
+          <div class="controls">
+            <button type="button" data-video-job-action="pause">暂停</button>
+            <button type="button" data-video-job-action="resume">继续</button>
+            <button type="button" data-video-job-action="cancel">取消</button>
+          </div>
+          <p id="video-failure-reason" role="alert">任务失败原因：暂无</p>
+          <p id="video-error" role="alert"></p>
+          <h3>分镜结果</h3>
+          <p class="helper-text">生成成功后会自动显示最新分镜；也可以在下方选择分镜版本。</p>
+          <div id="storyboard-versions" class="list-panel" aria-label="选择分镜版本"></div>
+          <div id="storyboard-board" class="review-board" aria-label="分镜看板">
+            <h4>分镜看板</h4>
+            <p class="helper-text">生成或选择分镜版本后，这里会显示关键帧、片段和 AI 建议。</p>
+          </div>
+          <pre id="video-summary">项目状态会显示在这里</pre>
+          <form id="storyboard-editor-form" class="storyboard-editor">
+            <label>
+              当前分镜 JSON
+              <textarea
+                id="storyboard-plan-editor"
+                name="storyboard_plan"
+                placeholder="生成分镜成功后会自动填入；也可点击上方版本按钮查看"
+              ></textarea>
+            </label>
+            <label>
+              AI 建议 / 修改说明
+              <textarea
+                id="storyboard-suggestion"
+                name="storyboard_suggestion"
+                placeholder="记录 AI 建议或人工修改说明"
+              ></textarea>
+            </label>
+            <button type="submit">应用分镜编辑</button>
+          </form>
+          <h3>关键帧结果</h3>
+          <p class="helper-text">确认关键帧前，请检查每张实际生成图是否符合分镜。</p>
+          <div id="keyframe-list" class="results"></div>
+          <h3>连续帧检查</h3>
+          <p id="frame-progress-summary" class="helper-text">尚未检查连续帧。</p>
+          <div id="frame-issues" class="list-panel"></div>
+        </div>
       </section>
 
       <section id="history" data-page="历史">
         <h2>历史</h2>
-        <p>普通图片完成后会在上方显示受控媒体结果。统一历史页面将在后续阶段闭合。</p>
+        <div class="controls">
+          <select id="history-kind" aria-label="历史类型">
+            <option value="">全部</option>
+            <option value="image">图片</option>
+            <option value="video">视频</option>
+          </select>
+          <button id="refresh-history" type="button">刷新历史</button>
+        </div>
+        <div id="history-list" class="history-list"></div>
       </section>
 
       <section id="settings" data-page="设置">
         <h2>设置</h2>
         <button id="load-config-status" type="button">检查凭证配置状态</button>
         <pre id="config-status">尚未检查</pre>
+        <form id="settings-form">
+          <label>
+            FFmpeg 路径
+            <input name="ffmpeg_path" placeholder="D:/ffmpeg/ffmpeg.exe" />
+          </label>
+          <label>
+            native 下载代理
+            <input name="native_download_proxy" placeholder="http://127.0.0.1:7890" />
+          </label>
+          <label>
+            图片每张积分费率
+            <input name="cost_rate_image_per_image" type="number" min="0" step="0.01" />
+          </label>
+          <label>
+            视频每帧积分费率
+            <input name="cost_rate_video_per_frame" type="number" min="0" step="0.01" />
+          </label>
+          <label>
+            界面背景
+            <select id="theme-select" name="theme">
+              <option value="theme-dark">深色默认</option>
+              <option value="theme-light">清爽浅色</option>
+            </select>
+          </label>
+          <button type="submit">保存设置</button>
+        </form>
+        <p id="settings-status"></p>
       </section>
     </main>
-    <script type="module" src="/assets/js/app.js"></script>
+    <script type="module" src="/assets/js/app.js?v=20260624-ui-pages"></script>
   </body>
 </html>

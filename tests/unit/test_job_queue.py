@@ -42,6 +42,23 @@ def test_pause_resume_and_cancel_control_dispatch(tmp_path: Path) -> None:
     assert queue.get(cancelled_id).status == JobStatus.CANCELLED
 
 
+def test_resume_requeues_image_related_needs_attention_job(tmp_path: Path) -> None:
+    queue = make_queue(tmp_path)
+    job_id = queue.enqueue("image.generate", {"prompt": "cat"})
+    claimed = queue.claim_next("worker-a")
+    assert claimed is not None
+    queue.needs_attention(
+        job_id,
+        "worker-a",
+        error_code="IMAGE_DOWNLOAD_FAILED",
+        error_message="图片下载失败",
+    )
+
+    queue.resume(job_id)
+
+    assert queue.get(job_id).status == JobStatus.QUEUED
+
+
 def test_recover_expired_jobs_distinguishes_unsent_and_uncertain_requests(
     tmp_path: Path,
 ) -> None:

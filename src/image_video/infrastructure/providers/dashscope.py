@@ -8,6 +8,8 @@ from typing import Any, cast
 
 import httpx
 
+from image_video.infrastructure.providers.executor import ProviderRequestExecutor
+
 DASHSCOPE_ENDPOINT = (
     "https://dashscope.aliyuncs.com/api/v1/services/"
     "aigc/multimodal-generation/generation"
@@ -31,9 +33,11 @@ class DashScopeProvider:
         api_key: str,
         client: httpx.Client | None = None,
         timeout: float = 120,
+        request_executor: ProviderRequestExecutor | None = None,
     ):
         self.api_key = api_key
         self.client = client or httpx.Client(timeout=timeout)
+        self.request_executor = request_executor
 
     @property
     def headers(self) -> dict[str, str]:
@@ -83,14 +87,22 @@ class DashScopeProvider:
         params: dict[str, Any],
         input_images: list[bytes] | None = None,
     ) -> DashScopeResult:
-        response = self.client.post(
-            DASHSCOPE_ENDPOINT,
-            headers=self.headers,
-            json=self.build_payload(
-                model=model, params=params, input_images=input_images
-            ),
+        def execute() -> httpx.Response:
+            response = self.client.post(
+                DASHSCOPE_ENDPOINT,
+                headers=self.headers,
+                json=self.build_payload(
+                    model=model, params=params, input_images=input_images
+                ),
+            )
+            response.raise_for_status()
+            return response
+
+        response = (
+            self.request_executor.run(execute, request_id="dashscope")
+            if self.request_executor is not None
+            else execute()
         )
-        response.raise_for_status()
         return self.parse_response(cast(dict[str, Any], response.json()))
 
     @staticmethod

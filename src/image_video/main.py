@@ -6,22 +6,27 @@ import subprocess
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from pathlib import Path
+from time import perf_counter
 from uuid import uuid4
 
 from fastapi import FastAPI, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
+from starlette.types import ASGIApp
 
 from image_video.api.base import default_settings_store, router
 from image_video.api.errors import BusinessValidationError
 from image_video.api.history import router as history_router
 from image_video.api.image_jobs import router as image_jobs_router
+from image_video.api.jobs import router as jobs_router
 from image_video.api.media import router as media_router
 from image_video.api.video_projects import router as video_projects_router
 from image_video.application.history import HistoryService
 from image_video.application.image_jobs import ImageJobService
+from image_video.application.media_uploads import MediaUploadService
 from image_video.application.video_projects import (
     FrameGenerator,
     LazyFrameGenerator,
@@ -37,12 +42,39 @@ from image_video.infrastructure.database.engine import (
 )
 from image_video.infrastructure.database.media import MediaRepository
 from image_video.infrastructure.database.queue import JobQueue
+from image_video.infrastructure.logging import JsonlLogger
 from image_video.infrastructure.providers.deepseek import DeepSeekPlanner
 from image_video.infrastructure.providers.matsca import (
     MatscaCredentials,
     MatscaMode,
     MatscaProvider,
 )
+
+
+class StructuredRequestLogMiddleware(BaseHTTPMiddleware):
+    def __init__(self, app: ASGIApp, *, logger: JsonlLogger):
+        super().__init__(app)
+        self.logger = logger
+
+    async def dispatch(
+        self, request: Request, call_next: RequestResponseEndpoint
+    ) -> Response:
+        request_id = request.headers.get("X-Request-ID") or str(uuid4())
+        started = perf_counter()
+        response = await call_next(request)
+        self.logger.write(
+            level="info",
+            event="http_request_completed",
+            request_id=request_id,
+            data={
+                "method": request.method,
+                "path": request.url.path,
+                "status_code": response.status_code,
+                "duration_ms": round((perf_counter() - started) * 1000, 3),
+            },
+        )
+        response.headers["X-Request-ID"] = request_id
+        return response
 
 
 def create_keyframe_generator(secrets: SecretSettings) -> MatscaKeyframeGenerator:
@@ -95,11 +127,18 @@ def create_app(data_root: Path | None = None) -> FastAPI:
             engine.dispose()
 
     app = FastAPI(title="图像与视频工作台", docs_url="/api/docs", lifespan=lifespan)
+    app.add_middleware(
+        StructuredRequestLogMiddleware,
+        logger=JsonlLogger(root / "logs" / "web.jsonl"),
+    )
     app.state.secrets = SecretSettings()
     app.state.settings_store = default_settings_store(root)
     initialize_database(engine)
     app.state.job_queue = JobQueue(engine)
     app.state.media_repository = MediaRepository(engine)
+    app.state.media_upload_service = MediaUploadService(
+        engine, app.state.media_repository, data_root=root
+    )
     app.state.image_job_service = ImageJobService(app.state.job_queue)
     app.state.video_project_service = VideoProjectService(engine, data_root=root)
     app.state.history_service = HistoryService(engine, data_root=root)
@@ -118,6 +157,7 @@ def create_app(data_root: Path | None = None) -> FastAPI:
     app.include_router(router)
     app.include_router(history_router)
     app.include_router(image_jobs_router)
+    app.include_router(jobs_router)
     app.include_router(media_router)
     app.include_router(video_projects_router)
     app.mount("/assets", StaticFiles(directory=frontend_root), name="frontend-assets")

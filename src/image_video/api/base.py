@@ -8,6 +8,7 @@ from uuid import uuid4
 
 from fastapi import APIRouter, Request
 
+from image_video.application.history import HistoryService
 from image_video.infrastructure.config import PublicSettings, SettingsStore
 
 router = APIRouter(prefix="/api/v1")
@@ -38,6 +39,12 @@ def models() -> dict[str, Any]:
 @router.get("/config/status")
 def config_status(request: Request) -> dict[str, Any]:
     return envelope(request.app.state.secrets.status())
+
+
+@router.get("/estimates/storage")
+def storage_estimate(request: Request) -> dict[str, Any]:
+    service: HistoryService = request.app.state.history_service
+    return envelope(service.storage_estimate())
 
 
 @router.get("/settings")

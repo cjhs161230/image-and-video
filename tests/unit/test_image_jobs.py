@@ -38,6 +38,19 @@ def test_image_job_validates_gpt_reference_limit(tmp_path: Path) -> None:
         )
 
 
+def test_image_job_normalizes_auto_size_and_rejects_invalid_size(tmp_path: Path) -> None:
+    service, queue = make_service(tmp_path)
+
+    job_id = service.submit(
+        ImageJobRequest(model="gpt-image-2", prompt="cat", size="")
+    )
+
+    assert queue.get(job_id).payload["size"] == "auto"
+
+    with pytest.raises(ValueError, match="size"):
+        service.submit(ImageJobRequest(model="gpt-image-2", prompt="cat", size="0x1024"))
+
+
 def test_submit_persists_normalized_image_job(tmp_path: Path) -> None:
     service, queue = make_service(tmp_path)
 
@@ -50,6 +63,8 @@ def test_submit_persists_normalized_image_job(tmp_path: Path) -> None:
             quality="medium",
             output_format="png",
             matsca_mode="direct",
+            moderation="low",
+            output_compression=42,
         )
     )
 
@@ -58,4 +73,5 @@ def test_submit_persists_normalized_image_job(tmp_path: Path) -> None:
     assert job.kind == "image.generate"
     assert job.payload["model"] == "gpt-image-2"
     assert job.payload["n"] == 2
-
+    assert job.payload["moderation"] == "low"
+    assert job.payload["output_compression"] == 42

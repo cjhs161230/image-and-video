@@ -61,6 +61,12 @@ if (-not (Test-LocalPortAvailable -HostName $hostSetting -Port $webPort)) {
 }
 
 New-Item -ItemType Directory -Force -Path "data", "data\pids" | Out-Null
+$uvCacheDir = if ($env:IMAGE_VIDEO_UV_CACHE_DIR) {
+    $env:IMAGE_VIDEO_UV_CACHE_DIR
+} else {
+    "data\uv-cache"
+}
+New-Item -ItemType Directory -Force -Path $uvCacheDir | Out-Null
 
 if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
     Write-Error "uv 未安装或不在 PATH 中。"
@@ -68,10 +74,10 @@ if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
 
 $database = "data\db\workbench.db"
 if (Test-Path -LiteralPath $database) {
-    uv --cache-dir .uv-cache run python scripts\windows\prepare_database.py
+    uv --cache-dir $uvCacheDir run python scripts\windows\prepare_database.py
     $prepareExit = $LASTEXITCODE
     if ($prepareExit -eq 2) {
-        uv --cache-dir .uv-cache run alembic stamp head
+        uv --cache-dir $uvCacheDir run alembic stamp head
         if ($LASTEXITCODE -ne 0) {
             exit $LASTEXITCODE
         }
@@ -80,7 +86,7 @@ if (Test-Path -LiteralPath $database) {
     }
 }
 
-uv --cache-dir .uv-cache run alembic upgrade head
+uv --cache-dir $uvCacheDir run alembic upgrade head
 if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
@@ -91,13 +97,13 @@ if (-not (Test-Path -LiteralPath $ffmpeg)) {
 }
 
 $web = Start-Process -FilePath "uv" -ArgumentList @(
-    "--cache-dir", ".uv-cache", "run", "uvicorn", "image_video.main:app",
+    "--cache-dir", $uvCacheDir, "run", "uvicorn", "image_video.main:app",
     "--host", $hostSetting, "--port", $webPort
 ) -PassThru -WindowStyle Hidden
 Set-Content -Path "data\pids\web.pid" -Value $web.Id
 
 $worker = Start-Process -FilePath "uv" -ArgumentList @(
-    "--cache-dir", ".uv-cache", "run", "python", "-m", "image_video.worker.main"
+    "--cache-dir", $uvCacheDir, "run", "python", "-m", "image_video.worker.main"
 ) -PassThru -WindowStyle Hidden
 Set-Content -Path "data\pids\worker.pid" -Value $worker.Id
 

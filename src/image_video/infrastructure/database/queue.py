@@ -38,6 +38,45 @@ class JobQueue:
             session.commit()
         return job_id
 
+    def enqueue_unique_active(
+        self,
+        kind: str,
+        payload: dict[str, Any],
+        *,
+        match_keys: tuple[str, ...],
+    ) -> str:
+        now = utcnow()
+        with Session(self.engine) as session:
+            session.execute(text("BEGIN IMMEDIATE"))
+            active_jobs = session.scalars(
+                select(Job).where(
+                    Job.kind == kind,
+                    Job.status.in_(
+                        [JobStatus.QUEUED, JobStatus.RUNNING, JobStatus.PAUSED]
+                    ),
+                )
+            ).all()
+            for job in active_jobs:
+                if all(job.payload.get(key) == payload.get(key) for key in match_keys):
+                    session.commit()
+                    return job.id
+            job_id = str(uuid4())
+            session.add(
+                Job(
+                    id=job_id,
+                    kind=kind,
+                    payload=payload,
+                    status=JobStatus.QUEUED,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            session.add(
+                JobEvent(job_id=job_id, event="queued", data={}, created_at=now)
+            )
+            session.commit()
+            return job_id
+
     def get(self, job_id: str) -> Job:
         with Session(self.engine) as session:
             job = session.get(Job, job_id)
@@ -103,6 +142,19 @@ class JobQueue:
             job.updated_at = utcnow()
             session.commit()
 
+    def update_payload(self, job_id: str, worker_id: str, updates: dict[str, Any]) -> None:
+        with Session(self.engine) as session:
+            job = session.get(Job, job_id)
+            if (
+                job is None
+                or job.status != JobStatus.RUNNING
+                or job.locked_by != worker_id
+            ):
+                raise KeyError(job_id)
+            job.payload = {**job.payload, **updates}
+            job.updated_at = utcnow()
+            session.commit()
+
     def is_running_by(self, job_id: str, worker_id: str) -> bool:
         with Session(self.engine) as session:
             job = session.get(Job, job_id)
@@ -141,7 +193,36 @@ class JobQueue:
         self._transition(job_id, JobStatus.PAUSED, {"queued", "running"})
 
     def resume(self, job_id: str) -> None:
-        self._transition(job_id, JobStatus.QUEUED, {"paused"})
+        now = utcnow()
+        recoverable_prefixes = (
+            "image.",
+            "video.keyframes",
+            "video.keyframe",
+            "video.frames",
+            "video.frame",
+        )
+        with Session(self.engine) as session:
+            job = session.get(Job, job_id)
+            if job is None:
+                raise KeyError(job_id)
+            if job.status == JobStatus.PAUSED or (
+                job.status == JobStatus.NEEDS_ATTENTION
+                and job.kind.startswith(recoverable_prefixes)
+            ):
+                job.status = JobStatus.QUEUED
+                job.locked_by = None
+                job.lease_expires_at = None
+                job.heartbeat_at = None
+                job.updated_at = now
+                session.add(
+                    JobEvent(
+                        job_id=job.id,
+                        event=JobStatus.QUEUED.value,
+                        data={},
+                        created_at=now,
+                    )
+                )
+                session.commit()
 
     def cancel(self, job_id: str) -> None:
         self._transition(

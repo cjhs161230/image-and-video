@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import json
+from math import isfinite
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from urllib.parse import urlsplit, urlunsplit
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -23,12 +24,34 @@ def normalize_api_base_url(value: str) -> str:
 class PublicSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    ffmpeg_path: str = r"D:\ffmpeg\ffmpeg-master-latest-win64-gpl\bin\ffmpeg.exe"
+    ffmpeg_path: str = Field(
+        default=r"D:\ffmpeg\ffmpeg-master-latest-win64-gpl\bin\ffmpeg.exe",
+        min_length=1,
+    )
     native_download_proxy: str = ""
-    matsca_app_concurrency: int = Field(default=1, ge=1, le=1)
-    matsca_direct_concurrency: int = Field(default=5, ge=1, le=5)
-    matsca_native_concurrency: int = Field(default=50, ge=1, le=50)
+    matsca_direct_concurrency: int = Field(default=2, ge=1, le=2)
+    matsca_native_concurrency: int = Field(default=2, ge=1, le=2)
     cost_rates: dict[str, float] = Field(default_factory=dict)
+
+    @field_validator("native_download_proxy")
+    @classmethod
+    def validate_native_download_proxy(cls, value: str) -> str:
+        proxy = value.strip()
+        if not proxy:
+            return ""
+        if urlsplit(proxy).scheme.lower() not in {"http", "https", "socks5", "socks5h"}:
+            raise ValueError("native_download_proxy 只支持 HTTP(S) 或 SOCKS5")
+        return proxy
+
+    @field_validator("cost_rates")
+    @classmethod
+    def validate_cost_rates(cls, value: dict[str, float]) -> dict[str, float]:
+        allowed = {"image_per_image", "video_per_frame"}
+        if not set(value).issubset(allowed):
+            raise ValueError("cost_rates 包含未知费率")
+        if any(rate < 0 or not isfinite(rate) for rate in value.values()):
+            raise ValueError("cost_rates 必须为有限非负数")
+        return value
 
 
 class SecretSettings(BaseSettings):
@@ -40,10 +63,6 @@ class SecretSettings(BaseSettings):
     )
 
     dashscope_api_key: str = ""
-    matsca_app_base_url: str = "https://img.matsca.com/v1"
-    matsca_app_api_key: str = ""
-    matsca_app_id: str = ""
-    matsca_app_secret: str = ""
     matsca_direct_base_url: str = "https://img.matsca.com/v1"
     matsca_direct_api_key: str = ""
     matsca_native_base_url: str = "https://img.matsca.com/v1"
@@ -56,11 +75,6 @@ class SecretSettings(BaseSettings):
         return {
             "dashscope": bool(self.dashscope_api_key),
             "matsca": {
-                "app": bool(
-                    self.matsca_app_api_key
-                    and self.matsca_app_id
-                    and self.matsca_app_secret
-                ),
                 "direct": bool(self.matsca_direct_api_key),
                 "native": bool(self.matsca_native_api_key),
             },
@@ -75,7 +89,16 @@ class SettingsStore:
     def load(self) -> PublicSettings:
         if not self.path.exists():
             return PublicSettings()
-        return PublicSettings.model_validate_json(self.path.read_text(encoding="utf-8"))
+        loaded = json.loads(self.path.read_text(encoding="utf-8"))
+        if not isinstance(loaded, dict):
+            return PublicSettings()
+        raw = cast(dict[str, Any], loaded)
+        raw.pop("matsca_app_concurrency", None)
+        for field in ("matsca_direct_concurrency", "matsca_native_concurrency"):
+            value = raw.get(field)
+            if isinstance(value, int):
+                raw[field] = min(max(value, 1), 2)
+        return PublicSettings.model_validate(raw)
 
     def save(self, settings: PublicSettings) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)

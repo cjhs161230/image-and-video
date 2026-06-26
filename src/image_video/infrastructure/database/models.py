@@ -162,6 +162,9 @@ class VideoKeyframe(Base):
     description: Mapped[str] = mapped_column(Text, nullable=False, default="")
     path: Mapped[str] = mapped_column(Text, nullable=False)
     status: Mapped[str] = mapped_column(String(50), nullable=False, default="completed")
+    upstream_task_id: Mapped[str | None] = mapped_column(String(100))
+    client_task_id: Mapped[str | None] = mapped_column(String(160))
+    result_url: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
@@ -183,5 +186,8 @@ class VideoFrame(Base):
     path: Mapped[str] = mapped_column(Text, nullable=False)
     status: Mapped[str] = mapped_column(String(50), nullable=False, default="completed")
     error_message: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    upstream_task_id: Mapped[str | None] = mapped_column(String(100))
+    client_task_id: Mapped[str | None] = mapped_column(String(160))
+    result_url: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

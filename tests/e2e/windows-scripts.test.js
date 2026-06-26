@@ -16,6 +16,8 @@ for (const text of ["uv", "alembic upgrade head", "ffmpeg", "uvicorn", "worker.p
 }
 
 assert.match(startSource, /IMAGE_VIDEO_PORT/i);
+assert.match(startSource, /IMAGE_VIDEO_UV_CACHE_DIR/i);
+assert.match(startSource, /data\\uv-cache/i);
 assert.match(startSource, /17860/i);
 assert.match(startSource, /Start-Process\s+\$url/i);
 assert.doesNotMatch(startSource, /--port",\s*"8000/i);

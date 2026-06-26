@@ -12,7 +12,8 @@ def test_alembic_upgrade_creates_queue_tables(tmp_path: Path) -> None:
 
     command.upgrade(config, "head")
 
-    tables = set(inspect(create_engine(f"sqlite:///{database_path.as_posix()}")).get_table_names())
+    inspector = inspect(create_engine(f"sqlite:///{database_path.as_posix()}"))
+    tables = set(inspector.get_table_names())
     assert {
         "jobs",
         "job_events",
@@ -22,3 +23,21 @@ def test_alembic_upgrade_creates_queue_tables(tmp_path: Path) -> None:
         "video_keyframes",
         "video_frames",
     }.issubset(tables)
+    assert "upstream_task_id" in {
+        column["name"] for column in inspector.get_columns("video_keyframes")
+    }
+    assert "client_task_id" in {
+        column["name"] for column in inspector.get_columns("video_keyframes")
+    }
+    assert "result_url" in {
+        column["name"] for column in inspector.get_columns("video_keyframes")
+    }
+    assert "upstream_task_id" in {
+        column["name"] for column in inspector.get_columns("video_frames")
+    }
+    assert "client_task_id" in {
+        column["name"] for column in inspector.get_columns("video_frames")
+    }
+    assert "result_url" in {
+        column["name"] for column in inspector.get_columns("video_frames")
+    }
