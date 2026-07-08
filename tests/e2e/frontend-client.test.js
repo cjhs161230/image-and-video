@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   apiRequest,
   buildImageJobPayload,
+  buildImageJobResultViewModel,
   buildStoryboardVersionPayload,
   buildSettingsPayload,
   buildVideoDraftPayload,
@@ -64,8 +65,40 @@ assert.deepEqual(payload, {
   input_media_ids: ["media-1", "media-2"],
 });
 
+assert.deepEqual(
+  buildImageJobResultViewModel({
+    media: [],
+    result_urls: ["https://official.example/image.png"],
+  }),
+  {
+    media: [],
+    upstreamUrls: [
+      {
+        url: "https://official.example/image.png",
+        label: "上游图片 URL 1",
+      },
+    ],
+  },
+);
+
+assert.deepEqual(
+  buildImageJobResultViewModel({
+    media: [{ id: "media-1", url: "/api/v1/media/media-1" }],
+    result_urls: ["https://official.example/image.png"],
+  }),
+  {
+    media: [{ id: "media-1", url: "/api/v1/media/media-1" }],
+    upstreamUrls: [
+      {
+        url: "https://official.example/image.png",
+        label: "上游图片 URL 1",
+      },
+    ],
+  },
+);
+
 assert.equal(normalizePageId("#image-workbench"), "image-workbench");
-assert.equal(normalizePageId("video-projects"), "video-projects");
+assert.equal(normalizePageId("video-projects"), "image-workbench");
 assert.equal(normalizePageId("#missing"), "image-workbench");
 assert.equal(normalizePageId(""), "image-workbench");
 
@@ -310,6 +343,7 @@ assert.deepEqual(
     description: "结束",
     prompt: "end prompt",
     mediaUrl: "/api/v1/video-projects/project/keyframes/9/media",
+    resultUrl: "",
     imageAlt: "关键帧 9，时间 0.90s",
   },
 );
@@ -331,6 +365,7 @@ assert.deepEqual(
     status: "failed",
     range: "片段 0-9",
     message: "Matsca HTTP 400",
+    resultUrl: "",
     repairText: "修复第 3 帧",
   },
 );
@@ -444,7 +479,8 @@ assert.equal(incompleteVideoHistory.title, "草稿视频");
 assert.equal(incompleteVideoHistory.statusText, "状态：failed");
 assert.equal(incompleteVideoHistory.latestJobText, "最近任务：failed；上游 HTTP 502");
 assert.equal(incompleteVideoHistory.canPlay, false);
-assert.equal(incompleteVideoHistory.canContinue, true);
+assert.equal(incompleteVideoHistory.canContinue, false);
+assert.equal(incompleteVideoHistory.archivedText, "视频功能已归档，当前默认不可用。");
 
 const completedVideoHistory = buildVideoHistoryItemViewModel({
   id: "project-done",
@@ -455,44 +491,44 @@ const completedVideoHistory = buildVideoHistoryItemViewModel({
 assert.equal(completedVideoHistory.canPlay, true);
 
 const restoreCalls = [];
-const restoredProject = await restoreVideoProjectWorkspace("project-restore", {
-  fetchImpl: async (url) => {
-    restoreCalls.push(url);
-    if (url === "/api/v1/video-projects/project-restore") {
-      return new Response(
-        JSON.stringify({
-          data: {
-            project_id: "project-restore",
-            title: "恢复项目",
-            description: "继续做",
-            total_frames: 10,
-            fps: 10,
-            status: "awaiting_keyframe_approval",
+await assert.rejects(
+  () =>
+    restoreVideoProjectWorkspace("project-restore", {
+      fetchImpl: async (url) => {
+        restoreCalls.push(url);
+        if (url === "/api/v1/video-projects/project-restore") {
+          return new Response(
+            JSON.stringify({
+              data: {
+                project_id: "project-restore",
+                title: "恢复项目",
+                description: "继续做",
+                total_frames: 10,
+                fps: 10,
+                status: "awaiting_keyframe_approval",
+              },
+              error: null,
+              request_id: "restore-summary",
+            }),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          );
+        }
+        return new Response(
+          JSON.stringify({ data: [], error: null, request_id: "restore-empty" }),
+          {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
           },
-          error: null,
-          request_id: "restore-summary",
-        }),
-        { status: 200, headers: { "Content-Type": "application/json" } },
-      );
-    }
-    return new Response(JSON.stringify({ data: [], error: null, request_id: "restore-empty" }), {
-      status: 200,
-      headers: { "Content-Type": "application/json" },
-    });
-  },
-  setActiveProjectId: (projectId) => restoreCalls.push(`active:${projectId}`),
-  setPage: (pageId) => restoreCalls.push(`page:${pageId}`),
-  setFormValues: (summary) => restoreCalls.push(`form:${summary.title}:${summary.fps}`),
-  refreshArtifacts: () => restoreCalls.push("artifacts"),
-});
-assert.equal(restoredProject.project_id, "project-restore");
-assert.deepEqual(restoreCalls, [
-  "active:project-restore",
-  "page:video-projects",
-  "/api/v1/video-projects/project-restore",
-  "form:恢复项目:10",
-  "artifacts",
-]);
+        );
+      },
+      setActiveProjectId: (projectId) => restoreCalls.push(`active:${projectId}`),
+      setPage: (pageId) => restoreCalls.push(`page:${pageId}`),
+      setFormValues: (summary) => restoreCalls.push(`form:${summary.title}:${summary.fps}`),
+      refreshArtifacts: () => restoreCalls.push("artifacts"),
+    }),
+  /视频功能已归档/,
+);
+assert.deepEqual(restoreCalls, ["active:project-restore", "page:image-workbench"]);
 
 const jobCalls = [];
 await controlJob("job-1", "pause", async (url, options) => {

@@ -14,7 +14,10 @@ from image_video.infrastructure.database.engine import (
 from image_video.infrastructure.database.models import Job
 from image_video.infrastructure.database.queue import JobQueue
 from image_video.infrastructure.logging import JsonlLogger
-from image_video.infrastructure.providers.matsca import UpstreamDirectUnavailableError
+from image_video.infrastructure.providers.matsca import (
+    ProviderConfigurationError,
+    UpstreamDirectUnavailableError,
+)
 from image_video.worker import main as worker_main
 from image_video.worker.errors import RecoverableImageRetrievalError
 from image_video.worker.runner import WorkerRunner
@@ -59,11 +62,36 @@ def test_worker_marks_unknown_job_kind_failed(tmp_path: Path) -> None:
     job_id = queue.enqueue("unknown", {})
     runner = WorkerRunner(queue=queue, handlers={}, worker_id="worker-a")
 
-    assert runner.run_once()
+    assert not runner.run_once()
 
     job = queue.get(job_id)
-    assert job.status == JobStatus.FAILED
-    assert job.error_code == "UNSUPPORTED_JOB_KIND"
+    assert job.status == JobStatus.QUEUED
+    assert job.error_code is None
+
+
+def test_queue_claim_next_can_filter_allowed_job_kinds(tmp_path: Path) -> None:
+    queue = make_queue(tmp_path)
+    video_job_id = queue.enqueue("video.frames.generate", {})
+    image_job_id = queue.enqueue("image.generate", {})
+
+    claimed = queue.claim_next(
+        "worker-a", lease_seconds=60, allowed_kinds={"image.generate"}
+    )
+
+    assert claimed is not None
+    assert claimed.id == image_job_id
+    assert queue.get(image_job_id).status == JobStatus.RUNNING
+    assert queue.get(video_job_id).status == JobStatus.QUEUED
+
+
+def test_queue_claim_next_with_empty_allowed_kinds_claims_nothing(
+    tmp_path: Path,
+) -> None:
+    queue = make_queue(tmp_path)
+    job_id = queue.enqueue("image.generate", {})
+
+    assert queue.claim_next("worker-a", allowed_kinds=set()) is None
+    assert queue.get(job_id).status == JobStatus.QUEUED
 
 
 def test_worker_marks_sent_timeout_as_needs_attention(tmp_path: Path) -> None:
@@ -134,6 +162,30 @@ def test_worker_marks_upstream_direct_unavailable_with_specific_error_code(
     job = queue.get(job_id)
     assert job.status == JobStatus.FAILED
     assert job.error_code == "upstream_direct_unavailable"
+
+
+def test_worker_marks_provider_configuration_error_with_specific_code(
+    tmp_path: Path,
+) -> None:
+    queue = make_queue(tmp_path)
+    job_id = queue.enqueue("image.generate", {})
+
+    def invalid_provider_config(job: Job, worker_id: str) -> None:
+        del job, worker_id
+        raise ProviderConfigurationError("API Base URL 配置无效：必须是 http/https 地址")
+
+    runner = WorkerRunner(
+        queue=queue,
+        handlers={"image.generate": RecordingHandler(invalid_provider_config)},
+        worker_id="worker-a",
+    )
+
+    assert runner.run_once()
+
+    job = queue.get(job_id)
+    assert job.status == JobStatus.FAILED
+    assert job.error_code == "PROVIDER_CONFIGURATION_ERROR"
+    assert job.error_message == "供应商配置错误：API Base URL 配置无效：必须是 http/https 地址"
 
 
 def test_worker_records_safe_http_status_error_details(tmp_path: Path) -> None:
@@ -286,8 +338,24 @@ def test_build_runner_wires_worker_log_under_data_root(
     dashscope = image_handler.dashscope_provider()
     assert dashscope.request_executor is not None
     assert dashscope.request_executor.provider == "dashscope"
-    storyboard_handler = runner.handlers["video.storyboard.generate"]
-    assert storyboard_handler.planner.request_executor is not None
-    assert storyboard_handler.planner.request_executor.provider == "deepseek"
-    frame_handler = runner.handlers["video.frames.generate"]
-    assert hasattr(frame_handler.generator, "generate")
+    assert set(runner.handlers) == {"image.generate"}
+
+
+def test_build_runner_registers_video_handlers_only_when_enabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    secret_settings_type = worker_main.SecretSettings
+    monkeypatch.setattr(
+        worker_main,
+        "SecretSettings",
+        lambda: secret_settings_type(
+            _env_file=None,
+            matsca_direct_api_key="test-direct-key",
+            video_feature_enabled=True,
+        ),
+    )
+
+    runner = worker_main.build_runner(tmp_path)
+
+    assert "video.storyboard.generate" in runner.handlers
+    assert "video.frames.generate" in runner.handlers

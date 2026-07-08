@@ -25,6 +25,21 @@ def test_normalize_api_base_url_avoids_duplicate_v1(raw: str, expected: str) -> 
     assert normalize_api_base_url(raw) == expected
 
 
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "",
+        "img.matsca.com/v1",
+        "ftp://img.matsca.com/v1",
+        "data:image/png;base64,aW1hZ2U=",
+        f"https://img.matsca.com/{'a' * 2100}",
+    ],
+)
+def test_normalize_api_base_url_rejects_invalid_base_urls(raw: str) -> None:
+    with pytest.raises(ValueError, match="API Base URL"):
+        normalize_api_base_url(raw)
+
+
 def test_public_settings_rejects_secret_fields() -> None:
     with pytest.raises(ValidationError):
         PublicSettings.model_validate(
@@ -107,5 +122,6 @@ def test_secret_status_reports_presence_without_exposing_values() -> None:
         "dashscope": True,
         "matsca": {"direct": True, "native": False},
         "deepseek": True,
+        "video_feature_enabled": False,
     }
     assert not any(name.startswith("matsca_app_") for name in SecretSettings.model_fields)

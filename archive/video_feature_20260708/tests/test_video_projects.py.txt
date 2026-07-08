@@ -1422,7 +1422,6 @@ def test_list_frame_issues_reports_missing_records_and_files(tmp_path: Path) -> 
             "segment_end_frame": 3,
             "prompt": "walk",
             "error_message": "",
-            "result_url": "",
         },
         {
             "frame": 2,
@@ -1432,7 +1431,6 @@ def test_list_frame_issues_reports_missing_records_and_files(tmp_path: Path) -> 
             "segment_end_frame": 3,
             "prompt": "walk",
             "error_message": "",
-            "result_url": "",
         },
     ]
 
@@ -1495,7 +1493,6 @@ def test_frame_issues_include_error_and_time_for_frontend(tmp_path: Path) -> Non
         "segment_end_frame": 9,
         "prompt": "turn slowly",
         "error_message": "Matsca HTTP 400",
-        "result_url": "",
     }
     missing = next(issue for issue in issues if issue["frame"] == 1)
     assert missing["time_seconds"] == 0.1
@@ -1837,7 +1834,6 @@ def test_keyframe_previews_include_review_fields_for_frontend(
         "prompt": "start prompt",
         "path": previews[0]["path"],
         "media_url": f"/api/v1/video-projects/{project_id}/keyframes/0/media",
-        "result_url": "",
         "status": "completed",
     }
     assert previews[1]["time_seconds"] == 0.9

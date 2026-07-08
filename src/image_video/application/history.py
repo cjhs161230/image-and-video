@@ -83,7 +83,8 @@ class HistoryService:
                             "title": project.title,
                             "description": project.description,
                             "project_url": f"/api/v1/video-projects/{project.id}",
-                            "can_continue": True,
+                            "can_continue": False,
+                            "archived_message": "视频功能已归档，当前默认不可用。",
                             "latest_job_status": (
                                 latest_job.status.value if latest_job is not None else ""
                             ),

@@ -11,7 +11,10 @@ import httpx
 from image_video.infrastructure.database.models import Job
 from image_video.infrastructure.database.queue import JobQueue
 from image_video.infrastructure.logging import JsonlLogger, redact_sensitive
-from image_video.infrastructure.providers.matsca import UpstreamDirectUnavailableError
+from image_video.infrastructure.providers.matsca import (
+    ProviderConfigurationError,
+    UpstreamDirectUnavailableError,
+)
 from image_video.worker.errors import RecoverableImageRetrievalError
 
 
@@ -44,7 +47,11 @@ class WorkerRunner:
         return self.queue.recover_expired()
 
     def run_once(self) -> bool:
-        job = self.queue.claim_next(self.worker_id, lease_seconds=self.lease_seconds)
+        job = self.queue.claim_next(
+            self.worker_id,
+            lease_seconds=self.lease_seconds,
+            allowed_kinds=set(self.handlers),
+        )
         if job is None:
             return False
         self._log(
@@ -121,6 +128,23 @@ class WorkerRunner:
                 data={
                     "job_kind": job.kind,
                     "error_code": "upstream_direct_unavailable",
+                },
+            )
+        except ProviderConfigurationError as exc:
+            error_message = f"供应商配置错误：{_safe_exception_detail(exc)}"
+            self._try_fail(
+                job.id,
+                error_code="PROVIDER_CONFIGURATION_ERROR",
+                error_message=error_message,
+            )
+            self._log(
+                level="error",
+                event="job_failed",
+                job_id=job.id,
+                data={
+                    "job_kind": job.kind,
+                    "error_code": "PROVIDER_CONFIGURATION_ERROR",
+                    "error_message": error_message,
                 },
             )
         except httpx.HTTPStatusError as exc:
@@ -250,6 +274,13 @@ def _safe_http_status_error_message(exc: httpx.HTTPStatusError) -> str:
 
 
 def _safe_exception_message(exc: Exception) -> str:
+    detail = _safe_exception_detail(exc)
+    if detail == "任务处理失败":
+        return detail
+    return f"任务处理失败：{detail}"
+
+
+def _safe_exception_detail(exc: Exception) -> str:
     detail = str(exc).strip()
     if not detail:
         return "任务处理失败"
@@ -258,4 +289,4 @@ def _safe_exception_message(exc: Exception) -> str:
         return "任务处理失败"
     if len(redacted) > 500:
         redacted = f"{redacted[:500]}..."
-    return f"任务处理失败：{redacted}"
+    return redacted

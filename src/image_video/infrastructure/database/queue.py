@@ -85,16 +85,26 @@ class JobQueue:
             session.expunge(job)
             return job
 
-    def claim_next(self, worker_id: str, lease_seconds: int = 60) -> Job | None:
+    def claim_next(
+        self,
+        worker_id: str,
+        lease_seconds: int = 60,
+        allowed_kinds: set[str] | None = None,
+    ) -> Job | None:
+        if allowed_kinds == set():
+            return None
         now = utcnow()
         with Session(self.engine) as session:
             session.execute(text("BEGIN IMMEDIATE"))
-            job = session.scalar(
+            query = (
                 select(Job)
                 .where(Job.status == JobStatus.QUEUED)
                 .order_by(Job.created_at, Job.id)
                 .limit(1)
             )
+            if allowed_kinds is not None:
+                query = query.where(Job.kind.in_(allowed_kinds))
+            job = session.scalar(query)
             if job is None:
                 session.commit()
                 return None

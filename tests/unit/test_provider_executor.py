@@ -134,4 +134,6 @@ def test_provider_executor_writes_structured_success_event(tmp_path: Path) -> No
     ]
     assert record["event"] == "provider_request_succeeded"
     assert record["request_id"] == "task-1"
-    assert record["data"] == {"provider": "matsca", "attempt": 1}
+    assert record["data"]["provider"] == "matsca"
+    assert record["data"]["attempt"] == 1
+    assert record["data"]["elapsed_ms"] >= 0

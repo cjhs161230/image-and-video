@@ -3,15 +3,10 @@
 from __future__ import annotations
 
 import os
-import subprocess
 from pathlib import Path
+from typing import cast
 from uuid import uuid4
 
-from image_video.application.video_projects import (
-    MatscaFrameGenerator,
-    MatscaKeyframeGenerator,
-    VideoProjectService,
-)
 from image_video.infrastructure.config import SecretSettings, SettingsStore
 from image_video.infrastructure.database.engine import (
     create_database_engine,
@@ -21,7 +16,6 @@ from image_video.infrastructure.database.media import MediaRepository
 from image_video.infrastructure.database.queue import JobQueue
 from image_video.infrastructure.logging import JsonlLogger
 from image_video.infrastructure.providers.dashscope import DashScopeProvider
-from image_video.infrastructure.providers.deepseek import DeepSeekPlanner
 from image_video.infrastructure.providers.executor import CredentialGate, ProviderRequestExecutor
 from image_video.infrastructure.providers.limiter import AdaptiveLimiter
 from image_video.infrastructure.providers.matsca import (
@@ -30,16 +24,7 @@ from image_video.infrastructure.providers.matsca import (
     MatscaProvider,
 )
 from image_video.worker.image_handler import ImageJobHandler
-from image_video.worker.runner import WorkerRunner
-from image_video.worker.video_handler import (
-    VideoFrameHandler,
-    VideoFrameRepairHandler,
-    VideoKeyframeHandler,
-    VideoKeyframeRegenerateHandler,
-    VideoStitchHandler,
-    VideoStoryboardHandler,
-    VideoStoryboardReviewHandler,
-)
+from image_video.worker.runner import JobHandler, WorkerRunner
 
 
 def build_runner(data_root: Path = Path("data")) -> WorkerRunner:
@@ -77,11 +62,6 @@ def build_runner(data_root: Path = Path("data")) -> WorkerRunner:
         logger=provider_logger,
         provider="dashscope",
     )
-    deepseek_executor = ProviderRequestExecutor(
-        gate=CredentialGate(AdaptiveLimiter(max_concurrency=1, current_limit=1)),
-        logger=provider_logger,
-        provider="deepseek",
-    )
 
     def matsca_provider(mode_value: str) -> MatscaProvider:
         mode = MatscaMode(mode_value)
@@ -103,38 +83,6 @@ def build_runner(data_root: Path = Path("data")) -> WorkerRunner:
             request_executor=matsca_executors[mode],
         )
 
-    def keyframe_generator(prompt: str) -> bytes:
-        return MatscaKeyframeGenerator(
-            MatscaProvider(
-                MatscaCredentials(
-                    mode=MatscaMode.DIRECT,
-                    base_url=secrets.matsca_direct_base_url,
-                    api_key=secrets.matsca_direct_api_key,
-                ),
-                task_gate=matsca_gates[MatscaMode.DIRECT],
-                request_executor=matsca_executors[MatscaMode.DIRECT],
-            )
-        )(prompt)
-
-    def load_references(media_ids: list[str]) -> list[bytes]:
-        return [Path(asset.path).read_bytes() for asset in media.by_ids(media_ids)]
-
-    frame_generator = MatscaFrameGenerator(
-        MatscaProvider(
-            MatscaCredentials(
-                mode=MatscaMode.DIRECT,
-                base_url=secrets.matsca_direct_base_url,
-                api_key=secrets.matsca_direct_api_key,
-            ),
-            task_gate=matsca_gates[MatscaMode.DIRECT],
-            request_executor=matsca_executors[MatscaMode.DIRECT],
-        ),
-        reference_loader=load_references,
-    )
-
-    def run_ffmpeg(command: list[str]) -> None:
-        subprocess.run(command, check=True)
-
     handler = ImageJobHandler(
         queue=queue,
         media=media,
@@ -146,61 +94,117 @@ def build_runner(data_root: Path = Path("data")) -> WorkerRunner:
         ),
         native_download_proxy=public_settings.native_download_proxy,
     )
-    video_service = VideoProjectService(engine, data_root=data_root)
-    deepseek_planner = DeepSeekPlanner(
-        api_key=secrets.deepseek_api_key,
-        base_url=secrets.deepseek_base_url,
-        model=secrets.deepseek_model,
-        request_executor=deepseek_executor,
-    )
-    storyboard_handler = VideoStoryboardHandler(
-        service=video_service,
-        planner=deepseek_planner,
-        queue=queue,
-    )
-    storyboard_review_handler = VideoStoryboardReviewHandler(
-        service=video_service,
-        reviewer=deepseek_planner,
-        queue=queue,
-    )
-    keyframe_handler = VideoKeyframeHandler(
-        service=video_service,
-        generator=keyframe_generator,
-        queue=queue,
-    )
-    keyframe_regenerate_handler = VideoKeyframeRegenerateHandler(
-        service=video_service,
-        generator=keyframe_generator,
-        queue=queue,
-    )
-    frame_handler = VideoFrameHandler(
-        service=video_service,
-        generator=frame_generator,
-        queue=queue,
-        ffmpeg_path=public_settings.ffmpeg_path,
-    )
-    frame_repair_handler = VideoFrameRepairHandler(
-        service=video_service,
-        generator=frame_generator,
-        queue=queue,
-    )
-    stitch_handler = VideoStitchHandler(
-        service=video_service,
-        runner=run_ffmpeg,
-        queue=queue,
-    )
+    handlers: dict[str, JobHandler] = {"image.generate": handler}
+    if secrets.video_feature_enabled:
+        import subprocess
+
+        from image_video.application.video_projects import (
+            MatscaFrameGenerator,
+            MatscaKeyframeGenerator,
+            VideoProjectService,
+        )
+        from image_video.infrastructure.providers.deepseek import DeepSeekPlanner
+        from image_video.worker.video_handler import (
+            VideoFrameHandler,
+            VideoFrameRepairHandler,
+            VideoKeyframeHandler,
+            VideoKeyframeRegenerateHandler,
+            VideoStitchHandler,
+            VideoStoryboardHandler,
+            VideoStoryboardReviewHandler,
+        )
+
+        deepseek_executor = ProviderRequestExecutor(
+            gate=CredentialGate(AdaptiveLimiter(max_concurrency=1, current_limit=1)),
+            logger=provider_logger,
+            provider="deepseek",
+        )
+
+        def keyframe_generator(prompt: str) -> bytes:
+            return MatscaKeyframeGenerator(
+                MatscaProvider(
+                    MatscaCredentials(
+                        mode=MatscaMode.DIRECT,
+                        base_url=secrets.matsca_direct_base_url,
+                        api_key=secrets.matsca_direct_api_key,
+                    ),
+                    task_gate=matsca_gates[MatscaMode.DIRECT],
+                    request_executor=matsca_executors[MatscaMode.DIRECT],
+                )
+            )(prompt)
+
+        def load_references(media_ids: list[str]) -> list[bytes]:
+            return [Path(asset.path).read_bytes() for asset in media.by_ids(media_ids)]
+
+        frame_generator = MatscaFrameGenerator(
+            MatscaProvider(
+                MatscaCredentials(
+                    mode=MatscaMode.DIRECT,
+                    base_url=secrets.matsca_direct_base_url,
+                    api_key=secrets.matsca_direct_api_key,
+                ),
+                task_gate=matsca_gates[MatscaMode.DIRECT],
+                request_executor=matsca_executors[MatscaMode.DIRECT],
+            ),
+            reference_loader=load_references,
+        )
+
+        def run_ffmpeg(command: list[str]) -> None:
+            subprocess.run(command, check=True)
+
+        video_service = VideoProjectService(engine, data_root=data_root)
+        deepseek_planner = DeepSeekPlanner(
+            api_key=secrets.deepseek_api_key,
+            base_url=secrets.deepseek_base_url,
+            model=secrets.deepseek_model,
+            request_executor=deepseek_executor,
+        )
+        handlers.update(
+            {
+                "video.storyboard.generate": VideoStoryboardHandler(
+                    service=video_service,
+                    planner=deepseek_planner,
+                    queue=queue,
+                ),
+                "video.storyboard.review": VideoStoryboardReviewHandler(
+                    service=video_service,
+                    reviewer=deepseek_planner,
+                    queue=queue,
+                ),
+                "video.keyframes.generate": cast(
+                    JobHandler,
+                    VideoKeyframeHandler(
+                        service=video_service,
+                        generator=keyframe_generator,
+                        queue=queue,
+                    ),
+                ),
+                "video.keyframe.regenerate": VideoKeyframeRegenerateHandler(
+                    service=video_service,
+                    generator=keyframe_generator,
+                    queue=queue,
+                ),
+                "video.frames.generate": VideoFrameHandler(
+                    service=video_service,
+                    generator=frame_generator,
+                    queue=queue,
+                    ffmpeg_path=public_settings.ffmpeg_path,
+                ),
+                "video.frame.repair": VideoFrameRepairHandler(
+                    service=video_service,
+                    generator=frame_generator,
+                    queue=queue,
+                ),
+                "video.stitch": VideoStitchHandler(
+                    service=video_service,
+                    runner=run_ffmpeg,
+                    queue=queue,
+                ),
+            }
+        )
     return WorkerRunner(
         queue=queue,
-        handlers={
-            "image.generate": handler,
-            "video.storyboard.generate": storyboard_handler,
-            "video.storyboard.review": storyboard_review_handler,
-            "video.keyframes.generate": keyframe_handler,
-            "video.keyframe.regenerate": keyframe_regenerate_handler,
-            "video.frames.generate": frame_handler,
-            "video.frame.repair": frame_repair_handler,
-            "video.stitch": stitch_handler,
-        },
+        handlers=handlers,
         worker_id=f"worker-{os.getpid()}-{uuid4().hex[:8]}",
         logger=JsonlLogger(data_root / "logs" / "worker.jsonl"),
     )

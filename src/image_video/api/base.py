@@ -26,6 +26,20 @@ def envelope(data: Any, request_id: str | None = None) -> dict[str, Any]:
     return {"data": data, "error": None, "request_id": request_id or str(uuid4())}
 
 
+def error_envelope(
+    *,
+    code: str,
+    message: str,
+    details: Any = None,
+    request_id: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "data": None,
+        "error": {"code": code, "message": message, "details": details},
+        "request_id": request_id or str(uuid4()),
+    }
+
+
 @router.get("/health")
 def health() -> dict[str, Any]:
     return envelope({"status": "ok"})

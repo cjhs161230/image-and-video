@@ -35,6 +35,8 @@ class MatscaImageProvider(Protocol):
         moderation: str = "auto",
         output_format: str = "png",
         output_compression: int | None = None,
+        request_id: str | None = None,
+        native_download_proxy_configured: bool = False,
     ) -> list[GeneratedImage]: ...
 
     def edit(
@@ -48,6 +50,8 @@ class MatscaImageProvider(Protocol):
         output_format: str = "png",
         output_compression: int | None = None,
         input_fidelity: str | None = None,
+        request_id: str | None = None,
+        native_download_proxy_configured: bool = False,
     ) -> list[GeneratedImage]: ...
 
     def create_generation_task(
@@ -156,6 +160,10 @@ class ImageJobHandler:
                         int | None, payload.get("output_compression")
                     ),
                     input_fidelity=cast(str | None, payload.get("input_fidelity")),
+                    request_id=job.id,
+                    native_download_proxy_configured=bool(
+                        self.native_download_proxy
+                    ),
                 )
             elif matsca_mode != "native":
                 images = self._generate_matsca_async(
@@ -176,6 +184,10 @@ class ImageJobHandler:
                     output_format=str(payload["output_format"]),
                     output_compression=cast(
                         int | None, payload.get("output_compression")
+                    ),
+                    request_id=job.id,
+                    native_download_proxy_configured=bool(
+                        self.native_download_proxy
                     ),
                 )
         else:

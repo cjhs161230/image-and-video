@@ -166,7 +166,8 @@ def test_video_history_lists_all_project_states_with_continue_metadata(
     assert failed["title"] == "title failed"
     assert failed["description"] == "description failed"
     assert failed["project_url"] == "/api/v1/video-projects/project-failed"
-    assert failed["can_continue"] is True
+    assert failed["can_continue"] is False
+    assert failed["archived_message"] == "视频功能已归档，当前默认不可用。"
     assert failed["media_url"] == ""
     assert failed["updated_at"] == now.replace(microsecond=3, tzinfo=None).isoformat()
     assert failed["latest_job_status"] == "failed"

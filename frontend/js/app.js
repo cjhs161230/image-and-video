@@ -16,7 +16,7 @@ export async function apiRequest(path, options = {}, fetchImpl = fetch) {
   return payload.data;
 }
 
-const PAGE_IDS = ["image-workbench", "video-projects", "history", "settings"];
+const PAGE_IDS = ["image-workbench", "history", "settings"];
 const THEME_IDS = ["theme-dark", "theme-light"];
 const THEME_STORAGE_KEY = "image-video-theme";
 const TERMINAL_JOB_STATUSES = ["completed", "failed", "cancelled", "needs_attention"];
@@ -110,6 +110,20 @@ export function buildImageJobPayload(values, inputMediaIds = []) {
     payload.output_compression = Number(compression);
   }
   return payload;
+}
+
+export function buildImageJobResultViewModel(job = {}) {
+  const media = Array.isArray(job.media) ? job.media : [];
+  const resultUrls = Array.isArray(job.result_urls) ? job.result_urls : [];
+  return {
+    media,
+    upstreamUrls: resultUrls
+      .filter((url) => typeof url === "string" && url.trim())
+      .map((url, index) => ({
+        url,
+        label: `上游图片 URL ${index + 1}`,
+      })),
+  };
 }
 
 export function estimateImageCost(values, settings = {}, storage = {}) {
@@ -264,6 +278,7 @@ export function buildKeyframeViewModel(keyframe = {}, context = {}) {
     description: keyframe.description || "",
     prompt: keyframe.prompt || "",
     mediaUrl: keyframe.media_url || keyframe.url || "",
+    resultUrl: keyframe.result_url || "",
     imageAlt: `关键帧 ${frame}，时间 ${time}`,
   };
 }
@@ -277,6 +292,7 @@ export function buildFrameIssueViewModel(issue = {}, context = {}) {
     status: issue.status || "",
     range: `片段 ${issue.segment_start_frame}-${issue.segment_end_frame}`,
     message: issue.error_message || issue.prompt || "未返回具体原因",
+    resultUrl: issue.result_url || "",
     repairText: `修复第 ${frame} 帧`,
   };
 }
@@ -374,7 +390,8 @@ export function buildVideoHistoryItemViewModel(item = {}) {
     mediaUrl: item.media_url || "",
     coverUrl: item.cover_url || item.thumbnail_url || "",
     canPlay: Boolean(item.media_url),
-    canContinue: item.can_continue !== false,
+    canContinue: false,
+    archivedText: item.archived_message || "视频功能已归档，当前默认不可用。",
   };
 }
 
@@ -388,16 +405,12 @@ export async function restoreVideoProjectWorkspace(
     refreshArtifacts = () => {},
   } = {},
 ) {
+  void fetchImpl;
+  void setFormValues;
+  void refreshArtifacts;
   setActiveProjectId(projectId);
-  setPage("video-projects");
-  const summary = await apiRequest(
-    `/api/v1/video-projects/${encodeURIComponent(projectId)}`,
-    {},
-    fetchImpl,
-  );
-  setFormValues(summary);
-  await refreshArtifacts(summary);
-  return summary;
+  setPage("image-workbench");
+  throw new Error("视频功能已归档，当前默认不可用。");
 }
 
 export function deleteMedia(mediaId, fetchImpl = fetch) {
@@ -519,10 +532,13 @@ function initializeApp() {
   app.dataset.ready = "true";
   themeSelect.value = applyTheme(loadStoredTheme());
   showPage(window.location.hash);
-  videoReferenceInputs.innerHTML = createVideoReferenceInputMarkup();
+  if (videoReferenceInputs) {
+    videoReferenceInputs.innerHTML = createVideoReferenceInputMarkup();
+  }
 
   const currentVideoReferenceFiles = () => {
     const selections = {};
+    if (!videoForm) return selections;
     for (let index = 1; index <= 8; index += 1) {
       selections[index] = Boolean(videoForm.elements[`reference_${index}_file`]?.files?.[0]);
     }
@@ -530,6 +546,9 @@ function initializeApp() {
   };
 
   const renderReferenceToggle = () => {
+    if (!videoForm || !toggleVideoReferences || !videoReferenceSummary || !referencePanel) {
+      return;
+    }
     const state = buildReferenceToggleState(
       Object.fromEntries(new FormData(videoForm).entries()),
       uploadedVideoReferenceMediaIds,
@@ -556,13 +575,13 @@ function initializeApp() {
     themeSelect.value = applyTheme(saveStoredTheme(themeSelect.value));
   });
 
-  toggleVideoReferences.addEventListener("click", () => {
+  toggleVideoReferences?.addEventListener("click", () => {
     videoReferencesExpanded = !videoReferencesExpanded;
     renderReferenceToggle();
   });
 
-  videoReferenceInputs.addEventListener("input", renderReferenceToggle);
-  videoReferenceInputs.addEventListener("change", renderReferenceToggle);
+  videoReferenceInputs?.addEventListener("input", renderReferenceToggle);
+  videoReferenceInputs?.addEventListener("change", renderReferenceToggle);
 
   const renderImageEstimate = () => {
     const estimate = estimateImageCost(
@@ -577,6 +596,7 @@ function initializeApp() {
   };
 
   const renderVideoEstimate = () => {
+    if (!videoForm || !videoFrameEstimate || !videoCostEstimate) return;
     const values = Object.fromEntries(new FormData(videoForm).entries());
     const framePlan = calculateVideoFramePlan(values);
     const estimate = estimateVideoCost(values, publicSettings, storageEstimate);
@@ -591,6 +611,7 @@ function initializeApp() {
   };
 
   const applyJobControls = (container, selector, statusValue) => {
+    if (!container) return;
     const allowed = new Set(getControlActionsForStatus(statusValue));
     container.querySelectorAll(selector).forEach((button) => {
       const action = button.dataset.action || button.dataset.videoJobAction || "";
@@ -627,6 +648,7 @@ function initializeApp() {
   };
 
   const uploadVideoReferenceInputs = async () => {
+    if (!videoForm || !videoUploadStatus) return {};
     const uploadedReferenceMediaIds = {};
     let uploadCount = 0;
     for (let index = 1; index <= 8; index += 1) {
@@ -648,13 +670,27 @@ function initializeApp() {
     status.textContent = job.status;
     applyJobControls(panel, "[data-action]", job.status);
     error.textContent = job.error_message || "";
+    const resultModel = buildImageJobResultViewModel(job);
     results.replaceChildren(
-      ...(job.media || []).map((media) => {
+      ...resultModel.media.map((media) => {
         const image = document.createElement("img");
         image.src = media.url;
         image.alt = "生成结果";
         image.loading = "lazy";
         return image;
+      }),
+      ...resultModel.upstreamUrls.map((item) => {
+        const wrapper = document.createElement("p");
+        wrapper.className = "helper-text";
+        const label = document.createElement("span");
+        label.textContent = `${item.label}：`;
+        const link = document.createElement("a");
+        link.href = item.url;
+        link.textContent = item.url;
+        link.target = "_blank";
+        link.rel = "noreferrer";
+        wrapper.append(label, link);
+        return wrapper;
       }),
     );
     if (TERMINAL_JOB_STATUSES.includes(job.status)) {
@@ -663,6 +699,7 @@ function initializeApp() {
   };
 
   const renderVideoJob = (job) => {
+    if (!videoJobStatus || !videoFailureReason) return true;
     videoJobStatus.textContent = `${job.kind} / ${job.status}`;
     const failureMessage = formatJobFailureMessage(job);
     videoFailureReason.textContent = failureMessage
@@ -687,12 +724,15 @@ function initializeApp() {
         await refreshVideoArtifacts();
       }
     } catch (requestError) {
-      videoError.textContent = requestError.message;
+      if (videoError) {
+        videoError.textContent = requestError.message;
+      }
       clearInterval(videoPollTimer);
     }
   };
 
   const trackVideoJob = async (created) => {
+    if (!videoJobStatus) return;
     activeVideoJobId = created.job_id;
     videoJobStatus.textContent = created.status;
     clearInterval(videoPollTimer);
@@ -701,7 +741,7 @@ function initializeApp() {
   };
 
   const refreshVideoSummary = async () => {
-    if (!activeVideoProjectId) return;
+    if (!activeVideoProjectId || !videoSummary) return;
     videoSummary.textContent = JSON.stringify(
       await apiRequest(`/api/v1/video-projects/${activeVideoProjectId}`),
       null,
@@ -719,34 +759,16 @@ function initializeApp() {
     ]);
   };
 
-  const fillVideoFormFromSummary = (summary) => {
-    videoForm.elements.title.value = summary.title || "";
-    videoForm.elements.description.value = summary.description || "";
-    const fps = Number(summary.fps || 24);
-    const totalFrames = Math.max(1, Number(summary.total_frames || 1));
-    videoForm.elements.fps.value = fps;
-    videoForm.elements.duration_seconds.value = Number((totalFrames / fps).toFixed(3));
-    videoForm.elements.confirm_cost.checked = true;
-    videoForm.elements.confirm_high_cost.checked = true;
-    renderVideoEstimate();
-  };
-
-  const openVideoProject = async (projectId) => {
-    await restoreVideoProjectWorkspace(projectId, {
-      setActiveProjectId: (value) => {
-        activeVideoProjectId = value;
-        videoProjectId.textContent = value;
-      },
-      setPage: (pageId) => {
-        showPage(pageId, true);
-      },
-      setFormValues: fillVideoFormFromSummary,
-      refreshArtifacts: refreshVideoArtifacts,
-    });
-  };
-
   const loadStoryboardVersions = async () => {
-    if (!activeVideoProjectId) return [];
+    if (
+      !activeVideoProjectId ||
+      !storyboardVersions ||
+      !storyboardPlanEditor ||
+      !storyboardSuggestion ||
+      !storyboardBoard
+    ) {
+      return [];
+    }
     const versions = await apiRequest(
       `/api/v1/video-projects/${activeVideoProjectId}/storyboard/versions`,
     );
@@ -793,6 +815,7 @@ function initializeApp() {
   };
 
   function renderStoryboardBoard(version) {
+    if (!videoForm || !storyboardBoard) return;
     const values = Object.fromEntries(new FormData(videoForm).entries());
     const model = buildStoryboardViewModel(version, calculateVideoFramePlan(values));
     const title = document.createElement("h4");
@@ -857,7 +880,7 @@ function initializeApp() {
   }
 
   const loadKeyframes = async () => {
-    if (!activeVideoProjectId) return;
+    if (!activeVideoProjectId || !videoForm || !keyframeList) return;
     const values = Object.fromEntries(new FormData(videoForm).entries());
     const framePlan = calculateVideoFramePlan(values);
     const keyframes = await apiRequest(`/api/v1/video-projects/${activeVideoProjectId}/keyframes`);
@@ -886,11 +909,21 @@ function initializeApp() {
         description.textContent = `描述：${model.description || "无"}`;
         const prompt = document.createElement("p");
         prompt.textContent = `提示词：${model.prompt || "无"}`;
+        const resultUrl = document.createElement("p");
+        resultUrl.className = "helper-text";
+        if (model.resultUrl) {
+          const link = document.createElement("a");
+          link.href = model.resultUrl;
+          link.textContent = "上游图片 URL";
+          link.target = "_blank";
+          link.rel = "noreferrer";
+          resultUrl.append(link);
+        }
         const button = document.createElement("button");
         button.type = "button";
         button.dataset.regenerateFrame = model.frame;
         button.textContent = `重生成第 ${model.frame} 帧`;
-        wrapper.append(title, image, description, prompt, button);
+        wrapper.append(title, image, description, prompt, resultUrl, button);
         return wrapper;
       }),
     );
@@ -899,7 +932,7 @@ function initializeApp() {
     }
   };
 
-  storyboardVersions.addEventListener("click", (event) => {
+  storyboardVersions?.addEventListener("click", (event) => {
     const versionButton = event.target.closest("[data-version-id]");
     if (!versionButton) return;
     activeStoryboardVersionId = versionButton.dataset.versionId;
@@ -923,7 +956,9 @@ function initializeApp() {
   });
 
   const loadFrameIssues = async () => {
-    if (!activeVideoProjectId) return;
+    if (!activeVideoProjectId || !videoForm || !frameProgressSummary || !frameIssues) {
+      return;
+    }
     const values = Object.fromEntries(new FormData(videoForm).entries());
     const framePlan = calculateVideoFramePlan(values);
     const issues = await apiRequest(`/api/v1/video-projects/${activeVideoProjectId}/frames/issues`);
@@ -945,13 +980,24 @@ function initializeApp() {
         range.textContent = model.range;
         const message = document.createElement("p");
         message.textContent = `原因：${model.message}`;
-        item.append(title, range, message, button);
+        const resultUrl = document.createElement("p");
+        resultUrl.className = "helper-text";
+        if (model.resultUrl) {
+          const link = document.createElement("a");
+          link.href = model.resultUrl;
+          link.textContent = "上游图片 URL";
+          link.target = "_blank";
+          link.rel = "noreferrer";
+          resultUrl.append(link);
+        }
+        item.append(title, range, message, resultUrl, button);
         return item;
       }),
     );
   };
 
   const runVideoAction = async (callback) => {
+    if (!videoError) return;
     videoError.textContent = "";
     try {
       await callback();
@@ -996,7 +1042,7 @@ function initializeApp() {
   });
 
   form.addEventListener("input", renderImageEstimate);
-  videoForm.addEventListener("input", () => {
+  videoForm?.addEventListener("input", () => {
     renderVideoEstimate();
     if (activeVideoProjectId) {
       autosaveVideoDraft(
@@ -1031,7 +1077,7 @@ function initializeApp() {
     }
   });
 
-  videoForm.addEventListener("submit", async (event) => {
+  videoForm?.addEventListener("submit", async (event) => {
     event.preventDefault();
     await runVideoAction(async () => {
       const values = Object.fromEntries(new FormData(videoForm).entries());
@@ -1039,7 +1085,9 @@ function initializeApp() {
         videoForm,
         estimateVideoCost(values, publicSettings, storageEstimate),
       );
-      videoUploadStatus.textContent = "正在上传参考图...";
+      if (videoUploadStatus) {
+        videoUploadStatus.textContent = "正在上传参考图...";
+      }
       uploadedVideoReferenceMediaIds = await uploadVideoReferenceInputs();
       const payload = buildVideoDraftPayload(values, uploadedVideoReferenceMediaIds);
       if (!activeVideoProjectId) {
@@ -1048,7 +1096,9 @@ function initializeApp() {
           body: JSON.stringify(payload),
         });
         activeVideoProjectId = created.project_id;
-        videoProjectId.textContent = activeVideoProjectId;
+        if (videoProjectId) {
+          videoProjectId.textContent = activeVideoProjectId;
+        }
       } else {
         await apiRequest(`/api/v1/video-projects/${activeVideoProjectId}/draft`, {
           method: "PATCH",
@@ -1058,7 +1108,7 @@ function initializeApp() {
     });
   });
 
-  document.querySelector("#generate-storyboard").addEventListener("click", () =>
+  document.querySelector("#generate-storyboard")?.addEventListener("click", () =>
     runVideoAction(async () => {
       requireCostConfirmation(
         videoForm,
@@ -1076,7 +1126,7 @@ function initializeApp() {
     }),
   );
 
-  document.querySelector("#confirm-storyboard").addEventListener("click", () =>
+  document.querySelector("#confirm-storyboard")?.addEventListener("click", () =>
     runVideoAction(async () => {
       const versions = await loadStoryboardVersions();
       const versionId = activeStoryboardVersionId || versions.at(-1)?.version_id;
@@ -1088,7 +1138,7 @@ function initializeApp() {
     }),
   );
 
-  document.querySelector("#review-storyboard").addEventListener("click", () =>
+  document.querySelector("#review-storyboard")?.addEventListener("click", () =>
     runVideoAction(async () => {
       if (!activeVideoProjectId) throw new Error("请先创建视频项目");
       const versions = await loadStoryboardVersions();
@@ -1098,7 +1148,7 @@ function initializeApp() {
     }),
   );
 
-  storyboardEditorForm.addEventListener("submit", (event) => {
+  storyboardEditorForm?.addEventListener("submit", (event) => {
     event.preventDefault();
     runVideoAction(async () => {
       if (!activeVideoProjectId) throw new Error("请先创建视频项目");
@@ -1114,7 +1164,7 @@ function initializeApp() {
     });
   });
 
-  document.querySelector("#generate-keyframes").addEventListener("click", () =>
+  document.querySelector("#generate-keyframes")?.addEventListener("click", () =>
     runVideoAction(async () => {
       requireCostConfirmation(
         videoForm,
@@ -1133,7 +1183,7 @@ function initializeApp() {
     }),
   );
 
-  document.querySelector("#confirm-keyframes").addEventListener("click", () =>
+  document.querySelector("#confirm-keyframes")?.addEventListener("click", () =>
     runVideoAction(async () => {
       await apiRequest(`/api/v1/video-projects/${activeVideoProjectId}/keyframes/confirm`, {
         method: "POST",
@@ -1141,7 +1191,7 @@ function initializeApp() {
     }),
   );
 
-  document.querySelector("#generate-frames").addEventListener("click", () =>
+  document.querySelector("#generate-frames")?.addEventListener("click", () =>
     runVideoAction(async () => {
       requireCostConfirmation(
         videoForm,
@@ -1161,9 +1211,9 @@ function initializeApp() {
 
   document
     .querySelector("#check-frame-issues")
-    .addEventListener("click", () => runVideoAction(loadFrameIssues));
+    ?.addEventListener("click", () => runVideoAction(loadFrameIssues));
 
-  document.querySelector("#stitch-video").addEventListener("click", () =>
+  document.querySelector("#stitch-video")?.addEventListener("click", () =>
     runVideoAction(async () => {
       requireCostConfirmation(videoForm);
       await trackVideoJob(
@@ -1174,7 +1224,7 @@ function initializeApp() {
     }),
   );
 
-  keyframeList.addEventListener("click", async (event) => {
+  keyframeList?.addEventListener("click", async (event) => {
     const frame = event.target.dataset.regenerateFrame;
     if (!frame) return;
     await runVideoAction(async () => {
@@ -1188,7 +1238,7 @@ function initializeApp() {
     });
   });
 
-  frameIssues.addEventListener("click", async (event) => {
+  frameIssues?.addEventListener("click", async (event) => {
     const frame = event.target.dataset.repairFrame;
     if (!frame) return;
     await runVideoAction(async () => {
@@ -1201,13 +1251,15 @@ function initializeApp() {
     });
   });
 
-  document.querySelector("#video-projects").addEventListener("click", async (event) => {
+  document.querySelector("#video-projects")?.addEventListener("click", async (event) => {
     const action = event.target.dataset.videoJobAction;
     if (!action || !activeVideoJobId) return;
     try {
       renderVideoJob(await controlJob(activeVideoJobId, action));
     } catch (requestError) {
-      videoError.textContent = requestError.message;
+      if (videoError) {
+        videoError.textContent = requestError.message;
+      }
     }
   });
 
@@ -1238,6 +1290,10 @@ function initializeApp() {
           text.textContent = `${model.title} ${model.statusText}${
             model.latestJobText ? ` ${model.latestJobText}` : ""
           }${model.logSummary ? ` ${model.logSummary}` : ""}`;
+          const archived = document.createElement("p");
+          archived.className = "helper-text";
+          archived.textContent = model.archivedText;
+          row.append(archived);
           if (model.description) {
             const description = document.createElement("p");
             description.textContent = model.description;
@@ -1248,11 +1304,6 @@ function initializeApp() {
             updatedAt.textContent = model.updatedAtText;
             row.append(updatedAt);
           }
-          const openButton = document.createElement("button");
-          openButton.type = "button";
-          openButton.dataset.openVideoProjectId = item.id;
-          openButton.textContent = "进入项目";
-          row.append(openButton);
           if (item.media_url) {
             const link = document.createElement("a");
             link.href = item.media_url;
@@ -1261,11 +1312,6 @@ function initializeApp() {
             link.textContent = "播放视频";
             row.append(link);
           }
-          const button = document.createElement("button");
-          button.type = "button";
-          button.dataset.deleteVideoProjectId = item.id;
-          button.textContent = "删除项目";
-          row.append(button);
         }
         return row;
       }),
@@ -1276,29 +1322,10 @@ function initializeApp() {
 
   historyList.addEventListener("click", async (event) => {
     const mediaId = event.target.dataset.deleteMediaId;
-    const projectId = event.target.dataset.deleteVideoProjectId;
-    const openProjectId = event.target.dataset.openVideoProjectId;
-    if (openProjectId) {
-      try {
-        await openVideoProject(openProjectId);
-      } catch (requestError) {
-        const row = event.target.closest(".history-item");
-        if (row) {
-          const errorText = document.createElement("p");
-          errorText.textContent = requestError.message;
-          row.append(errorText);
-        }
-      }
-      return;
-    }
-    if (!mediaId && !projectId) return;
+    if (!mediaId) return;
     if (!globalThis.confirm("确认删除这条历史记录和媒体文件？")) return;
     try {
-      if (mediaId) {
-        await deleteMedia(mediaId);
-      } else {
-        await deleteVideoProject(projectId);
-      }
+      await deleteMedia(mediaId);
       document.querySelector("#refresh-history").click();
     } catch (requestError) {
       const row = event.target.closest(".history-item");

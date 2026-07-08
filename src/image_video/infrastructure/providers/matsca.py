@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import base64
 import binascii
+import os
 from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass
 from enum import StrEnum
 from types import TracebackType
 from typing import Any, cast
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 import httpx
@@ -70,7 +72,10 @@ class MatscaProvider:
     ):
         credentials.validate()
         self.credentials = credentials
-        self.base_url = normalize_api_base_url(credentials.base_url)
+        try:
+            self.base_url = normalize_api_base_url(credentials.base_url)
+        except ValueError as exc:
+            raise ProviderConfigurationError(str(exc)) from exc
         self.client = client or httpx.Client(timeout=timeout)
         self.task_gate = task_gate
         self.request_executor = request_executor
@@ -101,10 +106,10 @@ class MatscaProvider:
         moderation: str = "auto",
         output_format: str = "png",
         output_compression: int | None = None,
+        request_id: str | None = None,
+        native_download_proxy_configured: bool = False,
     ) -> list[GeneratedImage]:
-        response_format = (
-            "url" if self.credentials.mode == MatscaMode.NATIVE else "b64_json"
-        )
+        response_format = "b64_json"
         payload: dict[str, Any] = {
             "model": "gpt-image-2",
             "prompt": prompt,
@@ -114,9 +119,14 @@ class MatscaProvider:
             "n": n,
             "background": background,
             "moderation": moderation,
-            "output_format": output_format,
             "response_format": response_format,
         }
+        output_format_key = (
+            "output_image_format"
+            if self.credentials.mode == MatscaMode.NATIVE
+            else "output_format"
+        )
+        payload[output_format_key] = output_format
         if output_compression is not None:
             payload["output_compression"] = output_compression
         with self._request_slot():
@@ -125,7 +135,14 @@ class MatscaProvider:
                     f"{self.base_url}/images/generations",
                     headers={**self.headers, "Content-Type": "application/json"},
                     json=payload,
-                )
+                ),
+                request_id=request_id,
+                metadata=self._request_metadata(
+                    operation="image.generate",
+                    endpoint_path="/v1/images/generations",
+                    response_format=response_format,
+                    native_download_proxy_configured=native_download_proxy_configured,
+                ),
             )
         return self._parse_images(response.json())
 
@@ -250,6 +267,8 @@ class MatscaProvider:
         output_format: str = "png",
         output_compression: int | None = None,
         input_fidelity: str | None = None,
+        request_id: str | None = None,
+        native_download_proxy_configured: bool = False,
     ) -> list[GeneratedImage]:
         if not 1 <= len(images) <= 8:
             raise ValueError("图生图需要 1 到最多 8 张输入图片")
@@ -263,11 +282,14 @@ class MatscaProvider:
             "size": size,
             "quality": quality,
             "moderation": moderation,
-            "output_format": output_format,
-            "response_format": (
-                "url" if self.credentials.mode == MatscaMode.NATIVE else "b64_json"
-            ),
+            "response_format": "b64_json",
         }
+        output_format_key = (
+            "output_image_format"
+            if self.credentials.mode == MatscaMode.NATIVE
+            else "output_format"
+        )
+        data[output_format_key] = output_format
         if output_compression is not None:
             data["output_compression"] = str(output_compression)
         if input_fidelity is not None:
@@ -279,7 +301,14 @@ class MatscaProvider:
                     headers=self.headers,
                     data=data,
                     files=files,
-                )
+                ),
+                request_id=request_id,
+                metadata=self._request_metadata(
+                    operation="image.edit",
+                    endpoint_path="/v1/images/edits",
+                    response_format=data["response_format"],
+                    native_download_proxy_configured=native_download_proxy_configured,
+                ),
             )
         return self._parse_images(response.json())
 
@@ -288,7 +317,13 @@ class MatscaProvider:
             return self.base_url[: -len("/v1")]
         return self.base_url
 
-    def _send(self, operation: Callable[[], httpx.Response]) -> httpx.Response:
+    def _send(
+        self,
+        operation: Callable[[], httpx.Response],
+        *,
+        request_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> httpx.Response:
         def execute() -> httpx.Response:
             response = operation()
             response.raise_for_status()
@@ -296,7 +331,11 @@ class MatscaProvider:
 
         try:
             if self.request_executor is not None:
-                return self.request_executor.run(execute)
+                return self.request_executor.run(
+                    execute,
+                    request_id=request_id or "provider",
+                    metadata=metadata,
+                )
             return execute()
         except httpx.HTTPStatusError as exc:
             if self._response_error_code(exc.response) == "upstream_direct_unavailable":
@@ -304,6 +343,27 @@ class MatscaProvider:
                     "官方直连不可用 — 原生模式下官方 API 直连暂不可用"
                 ) from exc
             raise
+
+    def _request_metadata(
+        self,
+        *,
+        operation: str,
+        endpoint_path: str,
+        response_format: str,
+        native_download_proxy_configured: bool,
+    ) -> dict[str, Any]:
+        proxy_keys = _system_proxy_env_keys()
+        return {
+            "mode": self.credentials.mode.value,
+            "operation": operation,
+            "endpoint_path": endpoint_path,
+            "base_host": urlsplit(self.base_url).netloc,
+            "response_format": response_format,
+            "system_proxy_env_present": bool(proxy_keys),
+            "system_proxy_env_keys": proxy_keys,
+            "native_download_proxy_configured": native_download_proxy_configured,
+            "vpn_detectable": False,
+        }
 
     @staticmethod
     def _response_error_code(response: httpx.Response) -> str:
@@ -403,3 +463,13 @@ class _TaskSlot:
         traceback: TracebackType | None,
     ) -> bool | None:
         return self._context.__exit__(exc_type, exc, traceback)
+
+
+def _system_proxy_env_keys() -> list[str]:
+    candidates = {"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"}
+    present = {
+        key.upper()
+        for key, value in os.environ.items()
+        if key.upper() in candidates and value
+    }
+    return sorted(present)

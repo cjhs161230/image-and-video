@@ -1,6 +1,6 @@
 """Image job v1 API routes."""
 
-from typing import Any
+from typing import Any, cast
 
 from fastapi import APIRouter, Request, status
 
@@ -18,6 +18,13 @@ def _queue(request: Request) -> JobQueue:
 def _job_data(request: Request, job_id: str) -> dict[str, Any]:
     job = _queue(request).get(job_id)
     media = request.app.state.media_repository.for_job(job_id)
+    payload = job.payload
+    raw_result_urls = cast(object, payload.get("result_urls"))
+    result_urls = []
+    if isinstance(raw_result_urls, list):
+        result_urls = [
+            url for url in cast(list[object], raw_result_urls) if isinstance(url, str)
+        ]
     return {
         "id": job.id,
         "kind": job.kind,
@@ -25,6 +32,7 @@ def _job_data(request: Request, job_id: str) -> dict[str, Any]:
         "attempt_count": job.attempt_count,
         "error_code": job.error_code,
         "error_message": job.error_message,
+        "result_urls": result_urls,
         "media": [
             {"id": asset.id, "url": f"/api/v1/media/{asset.id}"}
             for asset in media

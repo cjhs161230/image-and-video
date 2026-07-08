@@ -14,7 +14,11 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 def normalize_api_base_url(value: str) -> str:
     raw = value.strip().rstrip("/")
+    if len(raw) > 2048:
+        raise ValueError("API Base URL 配置无效：长度超过 2048 字符")
     parts = urlsplit(raw)
+    if parts.scheme.lower() not in {"http", "https"} or not parts.netloc:
+        raise ValueError("API Base URL 配置无效：必须是 http/https 地址")
     path = parts.path.rstrip("/")
     if not path.endswith("/v1"):
         path = f"{path}/v1" if path else "/v1"
@@ -70,6 +74,7 @@ class SecretSettings(BaseSettings):
     deepseek_base_url: str = "https://api.deepseek.com"
     deepseek_api_key: str = ""
     deepseek_model: str = "deepseek-v4-flash"
+    video_feature_enabled: bool = False
 
     def status(self) -> dict[str, Any]:
         return {
@@ -79,6 +84,7 @@ class SecretSettings(BaseSettings):
                 "native": bool(self.matsca_native_api_key),
             },
             "deepseek": bool(self.deepseek_api_key),
+            "video_feature_enabled": self.video_feature_enabled,
         }
 
 

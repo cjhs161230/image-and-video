@@ -1,3 +1,7 @@
+param(
+    [switch]$Hidden
+)
+
 $ErrorActionPreference = "Stop"
 Set-Location -LiteralPath (Split-Path -Parent (Split-Path -Parent $PSScriptRoot))
 
@@ -38,6 +42,31 @@ function Test-LocalPortAvailable {
     } finally {
         $listener.Stop()
     }
+}
+
+function Start-ServiceProcess {
+    param(
+        [string]$Name,
+        [string[]]$Arguments,
+        [string]$PidPath,
+        [switch]$Hidden
+    )
+
+    if ($Hidden) {
+        $process = Start-Process -FilePath "uv" -ArgumentList $Arguments -PassThru -WindowStyle Hidden
+    } else {
+        $command = "uv " + (($Arguments | ForEach-Object { '"' + ($_ -replace '"', '\"') + '"' }) -join " ")
+        $process = Start-Process -FilePath "powershell" -ArgumentList @(
+            "-NoExit",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            "Set-Location -LiteralPath '$((Get-Location).Path -replace "'", "''")'; Write-Host '$Name 已启动，关闭此窗口会停止该进程。'; $command"
+        ) -PassThru
+    }
+    Set-Content -Path $PidPath -Value $process.Id
+    return $process
 }
 
 $hostSetting = if ($env:IMAGE_VIDEO_HOST) { $env:IMAGE_VIDEO_HOST } else { Get-DotEnvValue "IMAGE_VIDEO_HOST" }
@@ -96,16 +125,16 @@ if (-not (Test-Path -LiteralPath $ffmpeg)) {
     Write-Error "ffmpeg 不存在：$ffmpeg"
 }
 
-$web = Start-Process -FilePath "uv" -ArgumentList @(
+$webArguments = @(
     "--cache-dir", $uvCacheDir, "run", "uvicorn", "image_video.main:app",
     "--host", $hostSetting, "--port", $webPort
-) -PassThru -WindowStyle Hidden
-Set-Content -Path "data\pids\web.pid" -Value $web.Id
+)
+Start-ServiceProcess -Name "Web" -Arguments $webArguments -PidPath "data\pids\web.pid" -Hidden:$Hidden | Out-Null
 
-$worker = Start-Process -FilePath "uv" -ArgumentList @(
+$workerArguments = @(
     "--cache-dir", $uvCacheDir, "run", "python", "-m", "image_video.worker.main"
-) -PassThru -WindowStyle Hidden
-Set-Content -Path "data\pids\worker.pid" -Value $worker.Id
+)
+Start-ServiceProcess -Name "Worker" -Arguments $workerArguments -PidPath "data\pids\worker.pid" -Hidden:$Hidden | Out-Null
 
 $url = "http://$($hostSetting):$webPort"
 Start-Process $url

@@ -98,8 +98,11 @@ class FakeDashScopeProvider:
 
 
 class FakeNativeMatscaProvider:
+    generate_request_id = ""
+    edit_request_id = ""
+
     def generate(self, **kwargs: object) -> list[GeneratedImage]:
-        del kwargs
+        self.generate_request_id = str(kwargs.get("request_id", ""))
         return [GeneratedImage(url="https://official.example/image.png")]
 
     def create_generation_task(self, **kwargs: object) -> MatscaImageTask:
@@ -110,8 +113,14 @@ class FakeNativeMatscaProvider:
         raise AssertionError(f"native mode should not poll async task {task_id}")
 
     def edit(self, **kwargs: object) -> list[GeneratedImage]:
-        del kwargs
+        self.edit_request_id = str(kwargs.get("request_id", ""))
         return [GeneratedImage(url="https://official.example/image.png")]
+
+
+class FakeNativeBase64MatscaProvider(FakeNativeMatscaProvider):
+    def generate(self, **kwargs: object) -> list[GeneratedImage]:
+        self.generate_request_id = str(kwargs.get("request_id", ""))
+        return [GeneratedImage(content=png_bytes())]
 
 
 class RecordingNativeProvider:
@@ -119,9 +128,11 @@ class RecordingNativeProvider:
         self.url = url
         self.generate_calls = 0
         self.edit_calls = 0
+        self.generate_request_id = ""
+        self.edit_request_id = ""
 
     def generate(self, **kwargs: object) -> list[GeneratedImage]:
-        del kwargs
+        self.generate_request_id = str(kwargs.get("request_id", ""))
         self.generate_calls += 1
         return [GeneratedImage(url=self.url)]
 
@@ -133,7 +144,7 @@ class RecordingNativeProvider:
         raise AssertionError(f"native mode should not poll async task {task_id}")
 
     def edit(self, **kwargs: object) -> list[GeneratedImage]:
-        del kwargs
+        self.edit_request_id = str(kwargs.get("request_id", ""))
         self.edit_calls += 1
         return [GeneratedImage(url=self.url)]
 
@@ -243,6 +254,50 @@ def test_image_handler_uses_native_download_proxy_for_native_url_result(
     assert queue.get(job_id).status == JobStatus.COMPLETED
 
 
+def test_native_base64_result_saves_without_downloader_or_result_urls(
+    tmp_path: Path,
+) -> None:
+    engine = create_database_engine(tmp_path / "workbench.db")
+    initialize_database(engine)
+    queue = JobQueue(engine)
+    media = MediaRepository(engine)
+    job_id = ImageJobService(queue).submit(
+        ImageJobRequest(
+            model="gpt-image-2",
+            prompt="cat",
+            matsca_mode="native",
+            output_format="png",
+        )
+    )
+
+    def downloader(url: str, *, proxy: str | None = None) -> bytes:
+        del url, proxy
+        raise AssertionError("native b64_json result should not be downloaded")
+
+    handler = ImageJobHandler(
+        queue=queue,
+        media=media,
+        output_root=tmp_path / "outputs",
+        matsca_provider=lambda mode: FakeNativeBase64MatscaProvider(),
+        downloader=downloader,
+        native_download_proxy="http://127.0.0.1:7890",
+    )
+    runner = WorkerRunner(
+        queue=queue,
+        handlers={"image.generate": handler},
+        worker_id="worker-a",
+    )
+
+    assert runner.run_once()
+
+    stored = queue.get(job_id)
+    assert stored.status == JobStatus.COMPLETED
+    assert "result_urls" not in stored.payload
+    assets = media.for_job(job_id)
+    assert len(assets) == 1
+    assert Path(assets[0].path).read_bytes() == png_bytes()
+
+
 def test_native_url_result_is_persisted_before_download_failure(
     tmp_path: Path,
 ) -> None:
@@ -284,6 +339,7 @@ def test_native_url_result_is_persisted_before_download_failure(
     assert stored.payload["client_task_id"] == f"image-video-{job_id}"
     assert stored.payload["result_urls"] == ["https://official.example/image.png"]
     assert provider.generate_calls == 1
+    assert provider.generate_request_id == job_id
 
 
 def test_native_url_resume_downloads_existing_url_without_regenerating(
@@ -433,6 +489,88 @@ def test_image_handler_uses_native_proxy_only_for_edit_result_download(
         ("https://official.example/image.png", "http://127.0.0.1:7890")
     ]
     assert queue.get(job_id).status == JobStatus.COMPLETED
+
+
+def test_image_handler_passes_job_id_to_native_generation_provider(
+    tmp_path: Path,
+) -> None:
+    engine = create_database_engine(tmp_path / "workbench.db")
+    initialize_database(engine)
+    queue = JobQueue(engine)
+    job_id = ImageJobService(queue).submit(
+        ImageJobRequest(
+            model="gpt-image-2",
+            prompt="cat",
+            matsca_mode="native",
+            output_format="png",
+        )
+    )
+    provider = RecordingNativeProvider()
+    handler = ImageJobHandler(
+        queue=queue,
+        media=MediaRepository(engine),
+        output_root=tmp_path / "outputs",
+        matsca_provider=lambda mode: provider,
+        downloader=fake_downloader,
+    )
+    runner = WorkerRunner(
+        queue=queue,
+        handlers={"image.generate": handler},
+        worker_id="worker-a",
+    )
+
+    assert runner.run_once()
+
+    assert provider.generate_request_id == job_id
+
+
+def test_image_handler_passes_job_id_to_native_edit_provider(
+    tmp_path: Path,
+) -> None:
+    engine = create_database_engine(tmp_path / "workbench.db")
+    initialize_database(engine)
+    queue = JobQueue(engine)
+    media = MediaRepository(engine)
+    source_job = queue.enqueue("image.generate", {})
+    source_path = tmp_path / "source.png"
+    source_path.write_bytes(png_bytes())
+    media_id = media.record_image(
+        job_id=source_job,
+        model="gpt-image-2",
+        prompt="source",
+        parameters={},
+        path=source_path,
+        thumbnail_path=source_path,
+        width=64,
+        height=32,
+        sha256="hash",
+    )
+    queue.cancel(source_job)
+    job_id = ImageJobService(queue).submit(
+        ImageJobRequest(
+            model="gpt-image-2",
+            prompt="edit",
+            matsca_mode="native",
+            input_media_ids=[media_id],
+        )
+    )
+    provider = RecordingNativeProvider()
+    handler = ImageJobHandler(
+        queue=queue,
+        media=media,
+        output_root=tmp_path / "outputs",
+        matsca_provider=lambda mode: provider,
+        downloader=fake_downloader,
+    )
+    runner = WorkerRunner(
+        queue=queue,
+        handlers={"image.generate": handler},
+        worker_id="worker-a",
+    )
+
+    assert runner.run_once()
+
+    assert provider.edit_request_id == job_id
 
 
 def test_image_handler_uses_reference_media_for_gpt_edit(tmp_path: Path) -> None:

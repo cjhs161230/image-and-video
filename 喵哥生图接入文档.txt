@@ -1,0 +1,441 @@
+接入文档
+快速开始
+查看模式说明、端点、参数、示例和常见问题。
+
+快速开始
+调用模式
+API 端点
+连通性检测
+模型列表
+使用限制
+参数速查
+代码示例
+错误码
+常见问题
+快速开始
+3 步接入：
+
+1
+获取 Key
+在「密钥」Tab 创建 API Key
+
+2
+选模式
+直连仅需 Key；应用需 App 凭证
+
+3
+发请求
+兼容 OpenAI / Anthropic SDK
+
+最小示例（直连模式，仅需一个 Header）：
+curl https://img.matsca.com/v1/chat/completions \
+  -H "Authorization: Bearer sk-YOUR_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"auto","messages":[{"role":"user","content":"你好"}]}'
+调用模式
+系统支持应用、直连、原生、商用四种模式。应用、直连、原生是 Key 级模式，每个 Key 同一时间只能处在一种模式下；商用模式是账号级能力，开通后该账号下所有 Key 统一按商用模式计费。
+
+商用模式
+×3
+· 消耗 9,999 积分申请，自动开通
+· 独立资源池，适合高频调用
+· 适合代理分发场景
+直连模式
+×2
+· 仅需 API Key
+· 无需 App 凭证
+· 适合快速接入、个人使用
+应用模式
+1x
+· Key 需绑定 App
+· 需 X-App-ID + X-App-Secret
+· 基础费率，失败自动退款
+· 适合生产环境、商业服务
+原生模式
+×3
+· 独立 Key 模式
+· 官方 API 直连
+· 无法访问官方图片资源时需配置代理
+API 端点
+方法	端点	说明
+GET	/v1/ping	连通性检测（验证 Key 有效性、查看封禁状态）
+GET	/v1/models	获取可用模型列表
+POST	/v1/chat/completions	文本对话（OpenAI 兼容，支持流式）
+POST	/v1/completions	文本补全（OpenAI 兼容，支持流式）
+POST	/v1/responses	Responses API（OpenAI 兼容，支持流式 + 图片生成）
+POST	/v1/messages	文本对话（Anthropic 兼容，支持流式）
+POST	/v1/images/generations	文生图（支持流式、任意正整数尺寸）
+POST	/v1/images/edits	图生图 / 图片编辑
+POST	/v1/images/variations	图片变体
+POST	/api/image-tasks/generations	异步文生图任务
+POST	/api/image-tasks/edits	异步图生图任务
+GET	/api/image-tasks	查询异步图片任务状态和结果
+所有端点均兼容 OpenAI SDK 和 Anthropic SDK，可直接替换 base_url 使用。
+
+连通性检测（Ping）
+接口说明
+· 端点：GET /v1/ping
+· 用途：验证 API Key 有效性、网络连通性，以及查看 Key 的封禁状态
+· 认证：必须携带有效的 API Key（Authorization: Bearer sk-xxx）
+· 开销：不消耗积分、不占用上游资源，响应极快（通常 < 50ms）
+· 适用场景：接入调试、健康检查、CI/CD 流水线、客户端预检
+请求示例
+curl https://img.matsca.com/v1/ping \
+  -H "Authorization: Bearer sk-YOUR_KEY"
+正常响应示例
+{
+  "status": "ok",
+  "server_time": 1718880000.123,
+  "server_time_iso": "2026-06-21T12:00:00+0800",
+  "version": "1.0.0",
+  "auth": {
+    "status": "valid",
+    "key_id": "sk-abc12***",
+    "email": "user@example.com",
+    "role": "user"
+  }
+}
+被封禁时的响应
+{
+  "status": "ok",
+  "server_time": 1718880000.123,
+  "server_time_iso": "2026-06-21T12:00:00+0800",
+  "version": "1.0.0",
+  "auth": {
+    "status": "valid",
+    "key_id": "sk-abc12***",
+    "email": "user@example.com",
+    "role": "user",
+    "banned": true,
+    "ban_remaining_seconds": 720
+  }
+}
+当 Key 因无意义文本滥用被临时封禁时，响应中会包含 banned: true 和剩余封禁秒数。封禁到期后自动解封，无需操作。
+
+响应字段说明
+字段	类型	说明
+status	string	固定返回 "ok"
+server_time	float	服务器 Unix 时间戳（秒）
+server_time_iso	string	ISO 8601 格式服务器时间
+version	string	当前服务版本号
+auth.status	string	"valid" 表示 Key 有效
+auth.key_id	string	脱敏后的 Key ID（前 8 位 + ***）
+auth.email	string	关联的开发者邮箱
+auth.role	string	角色（user / admin）
+auth.banned	bool	仅封禁时出现，值为 true
+auth.ban_remaining_seconds	int	仅封禁时出现，剩余封禁秒数
+💡 提示：如果返回 401 错误，说明 API Key 无效或已过期。正常情况下返回 HTTP 200，可通过 status 字段判断服务状态。
+模型列表
+文本对话
+auto（默认，自动选择最优模型）—— 支持 GPT-4o、GPT-4.1、o3、o4-mini、Claude 等，具体以 /v1/models 返回为准。
+图片生成
+gpt-image-2 推荐 — 当前主力图片模型，支持任意正整数尺寸、透明背景、流式生成、vivid/natural 风格
+codex-gpt-image-2 — 代码专用图片模型
+别名兼容：dall-e-3、dall-e-2、gpt-image-1、chatgpt-image-latest 等均自动映射到 gpt-image-2。系统还会动态识别更多图片模型。
+使用限制
+文本并发（单 Key 同时进行中）
+模式	普通客户	商用客户
+应用模式	4	12
+直连模式	8	16
+原生模式	12	48
+请求频率上限 500 次/分钟。超出并发限制的请求会排队等待，超时返回 429。
+
+图片生成并发（单 Key 同时进行中）
+普通客户
+2 个任务
+商用客户
+4 个任务
+异步图片任务独立于文本并发，单独计数。超限时请求会排队，全局队列上限 240。
+
+密钥数量上限
+普通客户
+最多 3 个
+商用客户
+最多 6 个
+图片生成参数
+单次生成数量
+1 ~ 4 张
+单次上传图片数
+最多 8 张
+单张上传大小
+10 MB
+上传总量
+80 MB
+生成超时
+10 分钟
+智能响应缓存
+· 文本请求自动启用响应缓存，相同请求内容可即时返回结果
+· 缓存按 Key 隔离，不同 Key 互不影响
+· 缓存命中同样正常扣积分
+· 缓存有效期 5 分钟，过期后自动请求上游
+积分与计费
+· 文本对话：按接口基础扣分 + 模式倍率（应用 1x / 直连 ×2 / 商用 ×3）
+· 图片生成：基础分 × 图片数量 × 尺寸质量倍率 × 模式倍率
+· 原生模式：默认 ×3；同步图片接口走官方 API 直连
+· 闲时卡和限时无限量卡生效时，本次调用免扣积分
+· 普通失败：自动退还已扣积分；内容安全拦截：默认不退款，并追加策略罚金
+以上为默认值，管理员可根据实际情况调整。如需更高限额请联系管理员。
+
+参数速查
+文生图 / 图生图 公共参数
+model
+gpt-image-2（推荐）、dall-e-3、dall-e-2、auto
+prompt
+提示词（必填）
+n
+生成数量 1-4，默认 1
+size
+任意正整数宽高，如 1024x1024、1536x1024、2048x1152、3840x2160；auto 或空值由系统自动决定
+quality
+auto / low / medium / high（standard/hd 为旧版兼容别名）
+background
+auto / transparent / opaque
+style
+vivid / natural
+moderation
+auto / low
+stream
+true / false，流式生成图片
+partial_images
+0-4，流式时返回中间结果数量
+output_format
+png / jpeg / webp，输出格式
+output_compression
+0-100，jpeg/webp 压缩质量
+input_fidelity
+low / high，图生图输入保真度
+response_format
+b64_json（默认）/ url
+文本对话参数（OpenAI 兼容）
+model
+auto（默认）或指定模型名
+messages
+标准 OpenAI messages 数组
+stream
+true / false，流式输出
+n
+生成数量
+文本对话参数（Anthropic 兼容）
+model
+模型名
+messages
+Anthropic messages 格式
+system
+系统提示词
+stream
+true / false
+代码示例
+cURL — 直连模式（最简单）
+# 文本对话
+curl https://img.matsca.com/v1/chat/completions \
+  -H "Authorization: Bearer sk-YOUR_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"auto","messages":[{"role":"user","content":"你好"}]}'
+
+# 文生图
+curl https://img.matsca.com/v1/images/generations \
+  -H "Authorization: Bearer sk-YOUR_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-image-2",
+    "prompt": "一只橘猫坐在窗台上",
+    "n": 1,
+    "size": "1024x1024",
+    "quality": "high"
+  }'
+cURL — 应用模式（最划算，1x 费率）
+curl https://img.matsca.com/v1/images/generations \
+  -H "Authorization: Bearer sk-YOUR_KEY" \
+  -H "X-App-ID: app-YOUR_APP_ID" \
+  -H "X-App-Secret: as-YOUR_APP_SECRET" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-image-2",
+    "prompt": "一只橘猫坐在窗台上",
+    "size": "1024x1024"
+  }'
+cURL — 流式文本对话
+curl https://img.matsca.com/v1/chat/completions \
+  -H "Authorization: Bearer sk-YOUR_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"auto","messages":[{"role":"user","content":"你好"}],"stream":true}'
+cURL — Anthropic 兼容
+curl https://img.matsca.com/v1/messages \
+  -H "x-api-key: sk-YOUR_KEY" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "auto",
+    "max_tokens": 1024,
+    "messages": [{"role": "user", "content": "你好"}]
+  }'
+cURL — 图生图（multipart）
+curl https://img.matsca.com/v1/images/edits \
+  -H "Authorization: Bearer sk-YOUR_KEY" \
+  -F "image=@photo.png" \
+  -F "prompt=将背景替换为蓝色天空" \
+  -F "model=gpt-image-2" \
+  -F "size=1024x1024"
+Python — OpenAI SDK
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="https://img.matsca.com/v1",
+    api_key="sk-YOUR_KEY",
+    # 应用模式加上这行：
+    # default_headers={"X-App-ID": "app-xxx", "X-App-Secret": "as-xxx"},
+)
+
+# 文本对话
+resp = client.chat.completions.create(
+    model="auto",
+    messages=[{"role": "user", "content": "你好"}],
+)
+print(resp.choices[0].message.content)
+
+# 文生图
+image = client.images.generate(
+    model="gpt-image-2",
+    prompt="一只橘猫坐在窗台上",
+    n=1,
+    size="1024x1024",
+)
+
+# 图生图
+with open("photo.png", "rb") as f:
+    image = client.images.edit(
+        model="gpt-image-2",
+        image=f,
+        prompt="将背景替换为蓝色天空",
+    )
+Python — Anthropic SDK
+import anthropic
+
+client = anthropic.Anthropic(
+    api_key="sk-YOUR_KEY",
+    base_url="https://img.matsca.com/v1",
+)
+
+message = client.messages.create(
+    model="auto",
+    max_tokens=1024,
+    messages=[{"role": "user", "content": "你好"}],
+)
+print(message.content[0].text)
+JavaScript / Node.js — fetch
+const resp = await fetch("https://img.matsca.com/v1/images/generations", {
+  method: "POST",
+  headers: {
+    "Authorization": "Bearer sk-YOUR_KEY",
+    "Content-Type": "application/json",
+  },
+  body: JSON.stringify({
+    model: "gpt-image-2",
+    prompt: "一只橘猫坐在窗台上",
+    n: 1,
+    size: "1024x1024",
+  }),
+});
+
+const data = await resp.json();
+// data.data[0].b64_json → base64 图片
+原生模式 — 官方 API 直连
+为 Key 开启原生模式后，同步图片接口走官方 API 直连。若你的运行环境无法访问官方图片资源，需要在获取结果图片时配置 HTTP/SOCKS 代理。
+
+# Python：请求本 API 后，通过官方直连结果获取原生图片
+import requests
+
+API_KEY = "sk-YOUR_KEY"
+PROXY = "http://127.0.0.1:7890"  # 改成你的 HTTP/SOCKS 代理；无需代理可设为 None
+proxies = {"http": PROXY, "https": PROXY} if PROXY else None
+
+resp = requests.post(
+    "https://img.matsca.com/v1/images/generations",
+    headers={"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"},
+    json={
+        "model": "gpt-image-2",
+        "prompt": "一只橘猫坐在窗台上",
+        "size": "1024x1024",
+        "response_format": "url"
+    },
+    timeout=120,
+)
+resp.raise_for_status()
+image_url = resp.json()["data"][0]["url"]
+
+img = requests.get(image_url, proxies=proxies, timeout=120)
+img.raise_for_status()
+open("result.png", "wb").write(img.content)
+
+# 使用 SOCKS 代理时先安装：pip install "requests[socks]"
+// Node.js：请求本 API 后，通过代理获取原生图片
+// 需要 HTTP/HTTPS 代理时先安装：npm install undici
+import { writeFile } from "node:fs/promises";
+import { fetch, ProxyAgent } from "undici";
+
+const proxy = "http://127.0.0.1:7890"; // 改成你的 HTTP/HTTPS 代理；无需代理可设为 null
+const dispatcher = proxy ? new ProxyAgent(proxy) : undefined;
+
+const apiResp = await fetch("https://img.matsca.com/v1/images/generations", {
+  method: "POST",
+  headers: {
+    Authorization: "Bearer sk-YOUR_KEY",
+    "Content-Type": "application/json",
+  },
+  body: JSON.stringify({
+    model: "gpt-image-2",
+    prompt: "一只橘猫坐在窗台上",
+    size: "1024x1024",
+    response_format: "url",
+  }),
+});
+
+const { data } = await apiResp.json();
+const imageUrl = data[0].url;
+const imageResp = await fetch(imageUrl, { dispatcher });
+if (!imageResp.ok) throw new Error(`download failed: ${imageResp.status}`);
+await writeFile("result.png", Buffer.from(await imageResp.arrayBuffer()));
+原生模式按原生倍率计费，同步图片接口走官方 API 直连；文本接口和异步图片任务仍走常规链路。能直连官方图片资源的环境可以不设置代理；不能直连时，请只在获取结果图片这一步使用代理。
+应用模式接入指南
+1
+创建应用 在「应用」Tab 创建，首个应用 100 积分，后续 10,000 积分/个。
+2
+保存凭证 创建后展示 APP ID 和 APP Secret（仅一次），立即复制保存。
+3
+绑定并切换 Key 在「密钥」Tab 选择 App 后开启「应用模式」，每个 App 只能绑定一个 Key。
+4
+携带三个 Header Authorization + X-App-ID + X-App-Secret。
+错误码
+401
+API Key 无效 — Key 不存在、已禁用或格式错误。检查 Authorization Header。
+403
+凭证缺失或无效 — 应用模式必须使用该 Key 已绑定的 App，并同时携带 X-App-ID / X-App-Secret。
+429
+积分不足 / 频率限制 — 钱包余额不足、单 Key 并发超限或请求过快，请稍后重试。
+500
+服务异常 — 服务暂时不可用，请稍等重试。
+502
+服务错误 — 图片生成失败，请稍后重试。
+upstream_direct_unavailable
+官方直连不可用 — 原生模式下官方 API 直连暂不可用，请重试或联系管理员。
+常见问题
+Q: model 填 auto 还是指定模型？
+A: 推荐 auto，系统自动选择当前可用的最优模型。也可以指定具体模型名。
+Q: 直连模式和应用模式怎么选？
+A: 个人使用、调试用直连（只需 Key）；生产环境、量大用应用模式（1x 费率更划算）。应用模式需要先为 Key 绑定 App，且每个 App 只能绑定一个 Key。
+Q: 应用模式的 App Secret 丢了怎么办？
+A: 在「应用」Tab 点击「重新生成」，旧 Secret 立即失效。
+Q: 什么是原生模式？
+A: 原生模式按原生倍率计费，同步图片接口走官方 API 直连；文本接口和异步图片任务仍走常规链路。若你的运行环境无法访问官方图片资源，请在获取结果图片这一步设置 HTTP/SOCKS 代理。
+Q: 支持哪些图片尺寸？
+A: gpt-image-2 支持任意正整数宽高，系统会把你传入的 size 原样处理；auto 或不传 size 时由系统自动决定。
+Q: 支持流式输出吗？
+A: 文本对话和图片生成均支持 stream: true 流式输出。
+Q: /v1/responses 和 /v1/chat/completions 有什么区别？
+A: /v1/chat/completions 是标准 OpenAI Chat Completions 接口；/v1/responses 是 OpenAI Responses API，支持更灵活的 input 格式，还可以通过内置工具直接生成图片。两者均兼容 OpenAI SDK。
+Q: 什么是商用模式？
+A: 面向代理分发的商用模式，独立资源池。消耗 9,999 积分申请，扣费后自动开通，不支持退款。
+Q: 如何查看消费记录？
+A: 在「积分中心」Tab 查看钱包流水和 API 调用明细。
+Q: /v1/ping 是什么？怎么用？
+A: GET /v1/ping 是连通性检测端点，用于验证 API Key 是否有效、网络是否通畅。只需携带 Authorization Header 即可调用，不消耗积分、不占用上游资源。接入调试、健康检查或 CI/CD 流水线时推荐优先使用。如果 Key 被临时封禁（如无意义文本滥用），响应中会包含 banned 字段和剩余封禁时间。

@@ -3,15 +3,16 @@
 from __future__ import annotations
 
 import random
+import re
 import threading
 import time
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
-from typing import TypeVar
+from typing import Any, TypeVar
 
 import httpx
 
-from image_video.infrastructure.logging import JsonlLogger
+from image_video.infrastructure.logging import JsonlLogger, redact_sensitive
 from image_video.infrastructure.providers.limiter import AdaptiveLimiter
 
 T = TypeVar("T")
@@ -66,7 +67,13 @@ class ProviderRequestExecutor:
         self.logger = logger
         self.provider = provider
 
-    def run(self, operation: Callable[[], T], *, request_id: str = "provider") -> T:
+    def run(
+        self,
+        operation: Callable[[], T],
+        *,
+        request_id: str = "provider",
+        metadata: dict[str, Any] | None = None,
+    ) -> T:
         rate_limit_retries = 0
         server_retries = 0
         connection_retries = 0
@@ -76,14 +83,43 @@ class ProviderRequestExecutor:
             delay = self.jitter()
             if delay > 0:
                 self.sleep(delay)
+            started_at = self.clock()
+            if metadata is not None:
+                self._log(
+                    level="info",
+                    event="provider_request_started",
+                    request_id=request_id,
+                    data={"attempt": attempt, **metadata},
+                )
             try:
                 with self.gate.slot():
                     result = operation()
-            except httpx.TimeoutException:
+            except httpx.TimeoutException as exc:
+                self._log_failure(
+                    exc,
+                    request_id=request_id,
+                    attempt=attempt,
+                    started_at=started_at,
+                    metadata=metadata,
+                )
                 raise
-            except httpx.ConnectError:
+            except httpx.ConnectError as exc:
                 if connection_retries >= 2:
+                    self._log_failure(
+                        exc,
+                        request_id=request_id,
+                        attempt=attempt,
+                        started_at=started_at,
+                        metadata=metadata,
+                    )
                     raise
+                self._log_failure(
+                    exc,
+                    request_id=request_id,
+                    attempt=attempt,
+                    started_at=started_at,
+                    metadata=metadata,
+                )
                 connection_retries += 1
                 self.sleep(2 ** (connection_retries - 1))
                 continue
@@ -96,27 +132,126 @@ class ProviderRequestExecutor:
                         now=now, retry_after=retry_after
                     )
                     if rate_limit_retries >= 3:
+                        self._log_failure(
+                            exc,
+                            request_id=request_id,
+                            attempt=attempt,
+                            started_at=started_at,
+                            metadata=metadata,
+                        )
                         raise
+                    self._log_failure(
+                        exc,
+                        request_id=request_id,
+                        attempt=attempt,
+                        started_at=started_at,
+                        metadata=metadata,
+                    )
                     rate_limit_retries += 1
                     self.sleep(retry_after)
                     continue
                 if status >= 500:
                     self.gate.limiter.record_server_error(now=now)
                     if server_retries >= 2:
+                        self._log_failure(
+                            exc,
+                            request_id=request_id,
+                            attempt=attempt,
+                            started_at=started_at,
+                            metadata=metadata,
+                        )
                         raise
+                    self._log_failure(
+                        exc,
+                        request_id=request_id,
+                        attempt=attempt,
+                        started_at=started_at,
+                        metadata=metadata,
+                    )
                     server_retries += 1
                     self.sleep(2 ** (server_retries - 1))
                     continue
+                self._log_failure(
+                    exc,
+                    request_id=request_id,
+                    attempt=attempt,
+                    started_at=started_at,
+                    metadata=metadata,
+                )
+                raise
+            except Exception as exc:
+                self._log_failure(
+                    exc,
+                    request_id=request_id,
+                    attempt=attempt,
+                    started_at=started_at,
+                    metadata=metadata,
+                )
                 raise
             self.gate.limiter.record_success(now=self.clock())
-            if self.logger is not None:
-                self.logger.write(
-                    level="info",
-                    event="provider_request_succeeded",
-                    request_id=request_id,
-                    data={"provider": self.provider, "attempt": attempt},
-                )
+            success_data: dict[str, Any] = {
+                "attempt": attempt,
+                **(metadata or {}),
+                "elapsed_ms": self._elapsed_ms(started_at),
+            }
+            if isinstance(result, httpx.Response):
+                success_data["http_status"] = result.status_code
+            self._log(
+                level="info",
+                event="provider_request_succeeded",
+                request_id=request_id,
+                data=success_data,
+            )
             return result
+
+    def _log(
+        self,
+        *,
+        level: str,
+        event: str,
+        request_id: str,
+        data: dict[str, Any],
+    ) -> None:
+        if self.logger is None:
+            return
+        if "provider" not in data:
+            data = {"provider": self.provider, **data}
+        self.logger.write(
+            level=level,
+            event=event,
+            request_id=request_id,
+            data=data,
+        )
+
+    def _log_failure(
+        self,
+        exc: Exception,
+        *,
+        request_id: str,
+        attempt: int,
+        started_at: float,
+        metadata: dict[str, Any] | None,
+    ) -> None:
+        if metadata is None:
+            return
+        data: dict[str, Any] = {
+            "attempt": attempt,
+            **metadata,
+            "elapsed_ms": self._elapsed_ms(started_at),
+            "exception_type": type(exc).__name__,
+            "error_message": _safe_exception_message(exc),
+        }
+        if isinstance(exc, httpx.HTTPStatusError):
+            data["http_status"] = exc.response.status_code
+        self._log(
+            level="error",
+            event="provider_request_failed",
+            request_id=request_id,
+            data=data,
+        )
+
+    def _elapsed_ms(self, started_at: float) -> int:
+        return max(0, int((self.clock() - started_at) * 1000))
 
 
 def _retry_after_seconds(response: httpx.Response) -> float:
@@ -127,3 +262,16 @@ def _retry_after_seconds(response: httpx.Response) -> float:
         except ValueError:
             pass
     return 60
+
+
+def _safe_exception_message(exc: Exception) -> str:
+    detail = str(exc).strip()
+    if not detail:
+        return "provider request failed"
+    redacted = redact_sensitive(detail)
+    if not isinstance(redacted, str):
+        return "provider request failed"
+    without_urls = re.sub(r"https?://\S+", "[url]", redacted)
+    if len(without_urls) > 500:
+        without_urls = f"{without_urls[:500]}..."
+    return without_urls

@@ -1,17 +1,21 @@
 import base64
+import json
 import threading
+from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
 import respx
 
+from image_video.infrastructure.logging import JsonlLogger
 from image_video.infrastructure.providers.executor import CredentialGate, ProviderRequestExecutor
 from image_video.infrastructure.providers.limiter import AdaptiveLimiter
 from image_video.infrastructure.providers.matsca import (
     MatscaCredentials,
     MatscaMode,
     MatscaProvider,
+    ProviderConfigurationError,
     UpstreamDirectUnavailableError,
 )
 
@@ -31,9 +35,32 @@ def make_provider(mode: MatscaMode = MatscaMode.DIRECT) -> MatscaProvider:
     )
 
 
+def read_jsonl(path: Path) -> list[dict[str, Any]]:
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
 def test_only_direct_and_native_modes_are_supported() -> None:
     assert list(MatscaMode) == [MatscaMode.DIRECT, MatscaMode.NATIVE]
     assert make_provider().headers == {"Authorization": "Bearer test-key"}
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "img.matsca.com/v1",
+        "ftp://img.matsca.com/v1",
+        f"https://img.matsca.com/{'a' * 2100}",
+    ],
+)
+def test_provider_rejects_invalid_base_url_before_request(base_url: str) -> None:
+    with pytest.raises(ProviderConfigurationError, match="API Base URL"):
+        MatscaProvider(
+            MatscaCredentials(
+                mode=MatscaMode.NATIVE,
+                base_url=base_url,
+                api_key="test-key",
+            )
+        )
 
 
 @respx.mock
@@ -77,9 +104,12 @@ def test_generate_uses_base64_for_direct_mode() -> None:
 
 
 @respx.mock
-def test_native_mode_returns_url_for_proxy_download_stage() -> None:
+def test_native_mode_requests_base64_for_generation_success_rate() -> None:
     route = respx.post("https://img.matsca.com/v1/images/generations").mock(
-        return_value=httpx.Response(200, json={"data": [{"url": "https://cdn.test/image.png"}]})
+        return_value=httpx.Response(
+            200,
+            json={"data": [{"b64_json": base64.b64encode(b"native-png").decode()}]},
+        )
     )
 
     images = make_provider(MatscaMode.NATIVE).generate(
@@ -88,8 +118,8 @@ def test_native_mode_returns_url_for_proxy_download_stage() -> None:
 
     request = route.calls[0].request
     payload = request_json(request)
-    assert images[0].url == "https://cdn.test/image.png"
-    assert images[0].content is None
+    assert images[0].content == b"native-png"
+    assert images[0].url is None
     assert request.url == "https://img.matsca.com/v1/images/generations"
     assert request.headers["authorization"] == "Bearer test-key"
     assert request.headers["content-type"] == "application/json"
@@ -102,8 +132,8 @@ def test_native_mode_returns_url_for_proxy_download_stage() -> None:
         "n": 1,
         "background": "auto",
         "moderation": "auto",
-        "output_format": "png",
-        "response_format": "url",
+        "output_image_format": "png",
+        "response_format": "b64_json",
     }
 
 
@@ -114,6 +144,20 @@ def test_direct_generation_accepts_url_result_even_when_requesting_base64() -> N
     )
 
     images = make_provider().generate(
+        prompt="cat", size="1024x1024", quality="medium", style="natural", n=1
+    )
+
+    assert images[0].url == "https://cdn.test/image.png"
+    assert images[0].content is None
+
+
+@respx.mock
+def test_native_generation_still_accepts_url_result() -> None:
+    respx.post("https://img.matsca.com/v1/images/generations").mock(
+        return_value=httpx.Response(200, json={"data": [{"url": "https://cdn.test/image.png"}]})
+    )
+
+    images = make_provider(MatscaMode.NATIVE).generate(
         prompt="cat", size="1024x1024", quality="medium", style="natural", n=1
     )
 
@@ -169,11 +213,11 @@ def test_invalid_base64_has_clear_error() -> None:
 
 
 @respx.mock
-def test_native_edit_uses_sync_endpoint_and_requests_url() -> None:
+def test_native_edit_uses_sync_endpoint_and_requests_base64() -> None:
     route = respx.post("https://img.matsca.com/v1/images/edits").mock(
         return_value=httpx.Response(
             200,
-            json={"data": [{"url": "https://cdn.test/edited.png"}]},
+            json={"data": [{"b64_json": base64.b64encode(b"edited").decode()}]},
         )
     )
 
@@ -188,7 +232,8 @@ def test_native_edit_uses_sync_endpoint_and_requests_url() -> None:
 
     request = route.calls[0].request
     content = request.content
-    assert images[0].url == "https://cdn.test/edited.png"
+    assert images[0].content == b"edited"
+    assert images[0].url is None
     assert request.url == "https://img.matsca.com/v1/images/edits"
     assert request.headers["authorization"] == "Bearer test-key"
     assert b'name="image"; filename="reference-0.png"' in content
@@ -202,10 +247,10 @@ def test_native_edit_uses_sync_endpoint_and_requests_url() -> None:
     assert b"high" in content
     assert b'name="moderation"' in content
     assert b"auto" in content
-    assert b'name="output_format"' in content
+    assert b'name="output_image_format"' in content
     assert b"png" in content
     assert b'name="response_format"' in content
-    assert b"url" in content
+    assert b"b64_json" in content
     assert b'name="input_fidelity"' in content
 
 
@@ -482,3 +527,119 @@ def test_provider_raises_upstream_direct_unavailable_error() -> None:
             style="natural",
             n=1,
         )
+
+
+@respx.mock
+def test_native_generation_logs_started_and_succeeded_without_sensitive_data(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:7890")
+    route = respx.post("https://img.matsca.com/v1/images/generations").mock(
+        return_value=httpx.Response(
+            200,
+            json={"data": [{"url": "https://cdn.test/image.png"}]},
+        )
+    )
+    log_path = tmp_path / "provider.jsonl"
+    provider = MatscaProvider(
+        MatscaCredentials(
+            mode=MatscaMode.NATIVE,
+            base_url="https://img.matsca.com",
+            api_key="test-key",
+        ),
+        request_executor=ProviderRequestExecutor(
+            gate=CredentialGate(AdaptiveLimiter(max_concurrency=2, current_limit=2)),
+            sleep=lambda _: None,
+            jitter=lambda: 0,
+            logger=JsonlLogger(log_path),
+            provider="matsca.native",
+        ),
+    )
+
+    provider.generate(
+        request_id="job-native-1",
+        prompt="secret prompt must not be logged",
+        size="1024x1024",
+        quality="medium",
+        style="vivid",
+        n=1,
+    )
+
+    assert route.called
+    records = read_jsonl(log_path)
+    assert [record["event"] for record in records] == [
+        "provider_request_started",
+        "provider_request_succeeded",
+    ]
+    for record in records:
+        assert record["request_id"] == "job-native-1"
+        data = record["data"]
+        assert data["provider"] == "matsca.native"
+        assert data["mode"] == "native"
+        assert data["operation"] == "image.generate"
+        assert data["endpoint_path"] == "/v1/images/generations"
+        assert data["base_host"] == "img.matsca.com"
+        assert data["response_format"] == "b64_json"
+        assert data["attempt"] == 1
+        assert data["system_proxy_env_present"] is True
+        assert "HTTPS_PROXY" in data["system_proxy_env_keys"]
+        assert data["native_download_proxy_configured"] is False
+        assert data["vpn_detectable"] is False
+    assert records[1]["data"]["http_status"] == 200
+    assert isinstance(records[1]["data"]["elapsed_ms"], int)
+    serialized = "\n".join(json.dumps(record, ensure_ascii=False) for record in records)
+    assert "test-key" not in serialized
+    assert "Bearer" not in serialized
+    assert "secret prompt" not in serialized
+    assert "https://cdn.test/image.png" not in serialized
+
+
+@respx.mock
+def test_native_generation_logs_remote_protocol_failure(
+    tmp_path: Path,
+) -> None:
+    respx.post("https://img.matsca.com/v1/images/generations").mock(
+        side_effect=httpx.RemoteProtocolError(
+            "Server disconnected without sending a response."
+        )
+    )
+    log_path = tmp_path / "provider.jsonl"
+    provider = MatscaProvider(
+        MatscaCredentials(
+            mode=MatscaMode.NATIVE,
+            base_url="https://img.matsca.com",
+            api_key="test-key",
+        ),
+        request_executor=ProviderRequestExecutor(
+            gate=CredentialGate(AdaptiveLimiter(max_concurrency=2, current_limit=2)),
+            sleep=lambda _: None,
+            jitter=lambda: 0,
+            logger=JsonlLogger(log_path),
+            provider="matsca.native",
+        ),
+    )
+
+    with pytest.raises(httpx.RemoteProtocolError):
+        provider.generate(
+            request_id="job-native-failed",
+            prompt="cat",
+            size="1024x1024",
+            quality="medium",
+            style="vivid",
+            n=1,
+        )
+
+    records = read_jsonl(log_path)
+    assert [record["event"] for record in records] == [
+        "provider_request_started",
+        "provider_request_failed",
+    ]
+    failure = records[1]
+    assert failure["request_id"] == "job-native-failed"
+    assert failure["data"]["operation"] == "image.generate"
+    assert failure["data"]["exception_type"] == "RemoteProtocolError"
+    assert (
+        failure["data"]["error_message"]
+        == "Server disconnected without sending a response."
+    )
+    assert isinstance(failure["data"]["elapsed_ms"], int)
